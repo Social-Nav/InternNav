@@ -101,7 +101,11 @@ class LuminaNextDiTBlock(nn.Module):
 
         self.feed_forward = LuminaFeedForward(
             dim=dim,
-            inner_dim=4 * dim,
+            # The diffusers version pinned in the InternNav container uses
+            # ``inner_dim`` directly (rounded by ``multiple_of``).  The released
+            # InternVLA-N1-DualVLN checkpoint expects FFN weights with shape
+            # [1024, 384] for dim=384, so keep this block at 1024.
+            inner_dim=1024 if dim == 384 else 4 * dim,
             multiple_of=multiple_of,
             ffn_dim_multiplier=ffn_dim_multiplier,
         )
@@ -292,7 +296,11 @@ class LuminaNextDiT2DModel(ModelMixin, ConfigMixin):
 
         assert (hidden_size // num_attention_heads) % 4 == 0, "2d rope needs head dim to be divisible by 4"
 
-    def _set_gradient_checkpointing(self, module, value=False):
+    def _set_gradient_checkpointing(self, module=None, value=False, enable=None, **kwargs):
+        if enable is not None:
+            value = enable
+        if module is None:
+            module = self
         if hasattr(module, "gradient_checkpointing"):
             module.gradient_checkpointing = value
 

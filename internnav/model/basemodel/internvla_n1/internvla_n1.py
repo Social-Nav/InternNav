@@ -16,7 +16,6 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 from .internvla_n1_arch import InternVLAN1MetaForCausalLM, InternVLAN1MetaModel
 
 TRAJ_TOKEN_INDEX = 151667
-IMAGE_TOKEN_INDEX = 151655
 _RESNET_MEAN = [0.485, 0.456, 0.406]
 _RESNET_STD = [0.229, 0.224, 0.225]
 
@@ -54,6 +53,17 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
 
     def get_model(self):
         return self.model
+
+    def _get_model_input_embeddings(self):
+        if hasattr(self.model, 'embed_tokens'):
+            return self.model.embed_tokens
+        if hasattr(self.model, 'language_model'):
+            return self.model.language_model.get_input_embeddings()
+        return self.model.get_input_embeddings()
+
+    def _get_rope_index(self, *args, **kwargs):
+        rope_owner = self.model if hasattr(self.model, 'get_rope_index') else self
+        return rope_owner.get_rope_index(*args, **kwargs)
 
     def forward(
         self,
@@ -126,7 +136,7 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
         if inputs_embeds is None:
-            inputs_embeds = self.model.embed_tokens(input_ids)
+            inputs_embeds = self._get_model_input_embeddings()(input_ids)
             if pixel_values is not None:
                 pixel_values = pixel_values.type(self.visual.dtype)
                 image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
@@ -182,7 +192,7 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
                 or self.rope_deltas is None
                 or (past_key_values is None or past_key_values.get_seq_length() == 0)
             ):
-                position_ids, rope_deltas = self.get_rope_index(
+                position_ids, rope_deltas = self._get_rope_index(
                     input_ids,
                     image_grid_thw,
                     video_grid_thw,
@@ -318,22 +328,28 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
         )
 
     def generate_latents(self, input_ids, pixel_values, image_grid_thw):
-        input_ids.to(self.get_model().device)
+        input_ids = input_ids.to(self.get_model().device)
         with torch.no_grad():
-            text_embeds = self.get_model().embed_tokens(input_ids)
+            text_embeds = self._get_model_input_embeddings()(input_ids)
         latent_queries = self.get_model().latent_queries.repeat(text_embeds.shape[0], 1, 1)
-        image_idx = input_ids == IMAGE_TOKEN_INDEX
+        image_idx = input_ids == self.config.image_token_id
         N_QUERY = self.get_n_query()
         input_ids = torch.cat([input_ids, torch.tensor([[TRAJ_TOKEN_INDEX] * N_QUERY]).to(input_ids.device)], dim=1)
 
         pixel_values = pixel_values.type(self.visual.dtype)
-        image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw).unsqueeze(0)
+        image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
 
-        text_embeds[image_idx] = image_embeds.to(text_embeds.device)[: image_idx.sum(), :]
+        n_image_tokens = image_idx.sum().item()
+        n_image_features = image_embeds.shape[0]
+        if n_image_tokens != n_image_features:
+            raise ValueError(
+                f"Image features and image tokens do not match: tokens: {n_image_tokens}, features {n_image_features}"
+            )
+        text_embeds[image_idx] = image_embeds.to(text_embeds.device, text_embeds.dtype)
 
         text_embeds = torch.cat([text_embeds, latent_queries], dim=1)
 
-        position_ids, _ = self.get_rope_index(input_ids, image_grid_thw)
+        position_ids, _ = self._get_rope_index(input_ids, image_grid_thw)
         with torch.no_grad():
             outputs = self.model(
                 inputs_embeds=text_embeds,

@@ -1,3 +1,4 @@
+import os
 from abc import ABC, abstractmethod
 
 import torch
@@ -5,6 +6,29 @@ import torch.nn as nn
 
 LatentEmbSize = 768
 MODEL_PATH_TO = "checkpoints"
+DEPTH_ANYTHING_REPO = "depth-anything/Depth-Anything-V2-Metric-Hypersim-Small"
+DEPTH_ANYTHING_FILENAME = "depth_anything_v2_metric_hypersim_vits.pth"
+
+
+def _resolve_depthanything_checkpoint():
+    explicit = os.environ.get('INTERNNAV_DEPTH_ANYTHING_CKPT', '').strip()
+    candidates = []
+    if explicit:
+        candidates.append(explicit)
+    candidates.append(os.path.join(MODEL_PATH_TO, DEPTH_ANYTHING_FILENAME))
+
+    for candidate in candidates:
+        if candidate and os.path.exists(candidate):
+            return candidate
+
+    try:
+        from huggingface_hub import hf_hub_download
+
+        return hf_hub_download(repo_id=DEPTH_ANYTHING_REPO, filename=DEPTH_ANYTHING_FILENAME, repo_type='model')
+    except Exception as exc:
+        raise FileNotFoundError(
+            f"Missing {DEPTH_ANYTHING_FILENAME}; set INTERNNAV_DEPTH_ANYTHING_CKPT or download from {DEPTH_ANYTHING_REPO}"
+        ) from exc
 
 
 def build_navdp(navdp_cfg, memory_size):
@@ -32,9 +56,10 @@ def build_depthanythingv2(config):
 
     model_configs = {'vits': {'encoder': 'vits', 'features': 64, 'out_channels': [48, 96, 192, 384]}}
     DAv2_model = DepthAnythingV2(**model_configs['vits'])
+    checkpoint_path = _resolve_depthanything_checkpoint()
     DAv2_model.load_state_dict(
-        torch.load(f'{MODEL_PATH_TO}/depth_anything_v2_metric_hypersim_vits.pth', map_location="cpu")
-    )  # download from https://huggingface.co/depth-anything/Depth-Anything-V2-Metric-Hypersim-Small/resolve/main/depth_anything_v2_metric_hypersim_vits.pth
+        torch.load(checkpoint_path, map_location="cpu")
+    )
     rgb_model = DAv2_model.pretrained
 
     return rgb_model
