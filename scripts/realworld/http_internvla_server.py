@@ -85,6 +85,7 @@ if __name__ == '__main__':
     parser.add_argument("--resize_w", type=int, default=384)
     parser.add_argument("--resize_h", type=int, default=384)
     parser.add_argument("--num_history", type=int, default=8)
+    parser.add_argument("--plan_step_gap", type=int, default=4)
     args = parser.parse_args()
 
     args.camera_intrinsic = np.array(
@@ -92,10 +93,11 @@ if __name__ == '__main__':
     )
     agent = InternVLAN1AsyncAgent(args)
     agent.step(
-        np.zeros((480, 640, 3)),
-        np.zeros((480, 640)),
+        np.zeros((480, 640, 3), dtype=np.uint8),
+        np.zeros((480, 640), dtype=np.float32),
         np.eye(4),
         "hello",
+        args.camera_intrinsic,
     )
     agent.reset()
 

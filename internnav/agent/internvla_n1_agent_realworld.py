@@ -15,35 +15,186 @@ sys.path.append(str(Path(__file__).parent.parent.parent))
 from collections import OrderedDict
 
 from PIL import Image
-from transformers import AutoProcessor
+from transformers import (
+    AutoConfig,
+    AutoModelForCausalLM,
+    AutoProcessor,
+    AutoTokenizer,
+    Qwen2_5_VLProcessor,
+    Qwen2VLImageProcessor,
+)
+try:
+    from transformers import Qwen2VLVideoProcessor
+except ImportError:
+    Qwen2VLVideoProcessor = None
 
-from internnav.model.basemodel.internvla_n1.internvla_n1 import InternVLAN1ForCausalLM
+from internnav.model.basemodel.internvla_n1.internvla_n1 import InternVLAN1ForCausalLM, InternVLAN1ModelConfig
 from internnav.model.utils.vln_utils import S2Output, split_and_clean, traj_to_actions
 
 DEFAULT_IMAGE_TOKEN = "<image>"
+QWEN_IMAGE_TOKEN = "<|vision_start|><|image_pad|><|vision_end|>"
+
+
+def _render_messages_with_qwen_image_tokens(messages):
+    rendered = []
+    for message in messages:
+        role = message.get('role', 'user')
+        content = message.get('content', '')
+        parts = []
+        if isinstance(content, list):
+            for item in content:
+                if isinstance(item, dict) and item.get('type') == 'image':
+                    parts.append(QWEN_IMAGE_TOKEN)
+                elif isinstance(item, dict):
+                    text = item.get('text', '')
+                    if text:
+                        parts.append(str(text))
+                else:
+                    parts.append(str(item))
+            content_text = ' '.join(part for part in parts if part)
+        else:
+            content_text = str(content)
+        rendered.append(f"<|im_start|>{role}\n{content_text}<|im_end|>")
+    rendered.append("<|im_start|>assistant\n")
+    return "\n".join(rendered)
+
+
+def _register_internvla_transformers_classes():
+    """Teach Transformers Auto* loaders about the InternVLA checkpoint type.
+
+    The released DualVLN checkpoint declares ``model_type=internvla_n1``.  Newer
+    Transformers versions reject that custom type unless it is registered before
+    processor/model loading.  The actual processor is still the Qwen2.5-VL
+    processor used by InternVLA-N1.
+    """
+    try:
+        AutoConfig.register('internvla_n1', InternVLAN1ModelConfig, exist_ok=True)
+    except Exception:
+        pass
+    try:
+        AutoModelForCausalLM.register(InternVLAN1ModelConfig, InternVLAN1ForCausalLM, exist_ok=True)
+    except Exception:
+        pass
+    try:
+        AutoProcessor.register(InternVLAN1ModelConfig, Qwen2_5_VLProcessor, exist_ok=True)
+    except Exception:
+        pass
+
+
+def _resolve_runtime_device(requested_device):
+    requested = str(requested_device or 'cpu').strip() or 'cpu'
+    strict_device = os.environ.get('INTERNNAV_STRICT_DEVICE', '').strip().lower() in {'1', 'true', 'yes', 'on'}
+    try:
+        device = torch.device(requested)
+    except Exception as exc:
+        if strict_device and requested != 'cpu':
+            raise RuntimeError(f"Failed to validate requested device '{requested}': {exc}") from exc
+        device = torch.device('cpu')
+        requested = 'cpu'
+
+    if device.type == 'cuda' and not torch.cuda.is_available():
+        if strict_device:
+            raise RuntimeError(f"Requested device '{requested}' but CUDA is unavailable")
+        return torch.device('cpu'), requested, 'cpu_fallback_no_cuda'
+    return device, requested, ('cpu' if device.type == 'cpu' else 'native')
+
+
+def _load_qwen25_vl_processor(model_path):
+    """Load Qwen2.5-VL processor across Transformers processor API variants.
+
+    Newer Transformers versions require a video processor component even when
+    the caller only uses image inputs.  The InternVLA-N1 real-world agent calls
+    the processor with ``images=...`` only, but the constructor still validates
+    that ``video_processor`` is a BaseVideoProcessor.
+    """
+    try:
+        return Qwen2_5_VLProcessor.from_pretrained(model_path)
+    except Exception:
+        tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=True)
+        image_processor = Qwen2VLImageProcessor.from_pretrained(model_path)
+        processor_kwargs = {
+            'image_processor': image_processor,
+            'tokenizer': tokenizer,
+        }
+        if Qwen2VLVideoProcessor is not None:
+            try:
+                processor_kwargs['video_processor'] = Qwen2VLVideoProcessor.from_pretrained(model_path)
+            except Exception:
+                try:
+                    processor_kwargs['video_processor'] = Qwen2VLVideoProcessor()
+                except Exception:
+                    pass
+
+        try:
+            return Qwen2_5_VLProcessor(**processor_kwargs)
+        except TypeError:
+            processor_kwargs.pop('video_processor', None)
+            return Qwen2_5_VLProcessor(**processor_kwargs)
+
+
+def _model_load_kwargs(device):
+    if device.type == 'cpu':
+        return {
+            'torch_dtype': torch.float32,
+            'attn_implementation': 'eager',
+        }
+    try:
+        import flash_attn  # noqa: F401
+        attn_implementation = 'flash_attention_2'
+    except Exception:
+        # Keep real GPU inference usable in lean runtime environments where the
+        # checkpoint and CUDA PyTorch are installed but flash-attn is not.
+        attn_implementation = 'sdpa'
+    return {
+        'torch_dtype': torch.bfloat16,
+        'attn_implementation': attn_implementation,
+        'device_map': {'': str(device)},
+    }
+
+
+def _env_int(name, default, minimum=None, maximum=None):
+    try:
+        value = int(str(os.environ.get(name, '')).strip() or default)
+    except Exception:
+        value = int(default)
+    if minimum is not None:
+        value = max(int(minimum), value)
+    if maximum is not None:
+        value = min(int(maximum), value)
+    return value
 
 
 class InternVLAN1AsyncAgent:
     def __init__(self, args):
-        self.device = torch.device(args.device)
+        _register_internvla_transformers_classes()
+        self.device, self.requested_device, self.runtime_mode = _resolve_runtime_device(args.device)
         self.save_dir = "test_data/" + datetime.now().strftime("%Y%m%d_%H%M%S")
-        print(f"args.model_path{args.model_path}")
+        os.makedirs(self.save_dir, exist_ok=True)
+        self.load_kwargs = _model_load_kwargs(self.device)
+        config = InternVLAN1ModelConfig.from_pretrained(args.model_path)
         self.model = InternVLAN1ForCausalLM.from_pretrained(
             args.model_path,
-            torch_dtype=torch.bfloat16,
-            attn_implementation="flash_attention_2",
-            device_map={"": self.device},
+            config=config,
+            **self.load_kwargs,
         )
         self.model.eval()
         self.model.to(self.device)
 
-        self.processor = AutoProcessor.from_pretrained(args.model_path)
+        self.processor = _load_qwen25_vl_processor(args.model_path)
         self.processor.tokenizer.padding_side = 'left'
+        if not getattr(self.processor, 'chat_template', None):
+            self.processor.chat_template = getattr(self.processor.tokenizer, 'chat_template', None)
 
         self.resize_w = args.resize_w
         self.resize_h = args.resize_h
         self.num_history = args.num_history
-        self.PLAN_STEP_GAP = args.plan_step_gap
+        self.PLAN_STEP_GAP = getattr(args, 'plan_step_gap', 4)
+        # Real-time Arena eval only needs the short waypoint/action token span.
+        # The upstream realworld script used 128 generated tokens and also
+        # copied all returned KV cache tensors, which can block the ROS command
+        # path for minutes on the first Isaac frame.  Keep this configurable for
+        # offline debugging, but default to the VLN adapter's short decode.
+        self.max_new_tokens = _env_int('ARENA_INTERNNAV_MAX_NEW_TOKENS', 10, minimum=1, maximum=128)
 
         prompt = "You are an autonomous navigation assistant. Your task is to <instruction>. Where should you go next to stay on track? Please output the next waypoint's coordinates in the image. Please output STOP when you have successfully completed the task."
         answer = ""
@@ -114,7 +265,7 @@ class InternVLAN1AsyncAgent:
         image = Image.fromarray(rgb).convert('RGB')
         image = image.resize((self.resize_w, self.resize_h))
         self.rgb_list.append(image)
-        image.save(f"{self.save_dir}/debug_raw_{self.episode_idx: 04d}.jpg")
+        image.save(f"{self.save_dir}/debug_raw_{self.episode_idx:04d}.jpg")
         self.episode_idx += 1
 
     def trajectory_tovw(self, trajectory, kp=1.0):
@@ -168,9 +319,9 @@ class InternVLAN1AsyncAgent:
         if not look_down:
             image = image.resize((self.resize_w, self.resize_h))
             self.rgb_list.append(image)
-            image.save(f"{self.save_dir}/debug_raw_{self.episode_idx: 04d}.jpg")
+            image.save(f"{self.save_dir}/debug_raw_{self.episode_idx:04d}.jpg")
         else:
-            image.save(f"{self.save_dir}/debug_raw_{self.episode_idx: 04d}_look_down.jpg")
+            image.save(f"{self.save_dir}/debug_raw_{self.episode_idx:04d}_look_down.jpg")
         if not look_down:
             self.conversation_history = []
             self.past_key_values = None
@@ -213,31 +364,61 @@ class InternVLAN1AsyncAgent:
 
         self.conversation_history.append({'role': 'user', 'content': content})
 
-        text = self.processor.apply_chat_template(self.conversation_history, tokenize=False, add_generation_prompt=True)
+        try:
+            text = self.processor.apply_chat_template(
+                self.conversation_history,
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+        except Exception:
+            # Some converted InternVLA checkpoints only keep the tokenizer chat
+            # template, which does not understand Qwen-VL list content blocks.
+            # Flatten the message blocks while preserving image placeholders so
+            # the processor still aligns `images=self.input_images` correctly.
+            text = _render_messages_with_qwen_image_tokens(self.conversation_history)
 
+        if text.count('<|image_pad|>') != len(self.input_images):
+            # The checkpoint tokenizer may ship a text-only chat template; in
+            # that case `apply_chat_template` succeeds but drops image blocks,
+            # causing Qwen2.5-VL to see zero image tokens while the processor
+            # supplies image features.  Re-render explicitly with Qwen's image
+            # sentinel tokens so image tokens and image features stay aligned.
+            text = _render_messages_with_qwen_image_tokens(self.conversation_history)
+
+        t_processor0 = time.time()
         inputs = self.processor(text=[text], images=self.input_images, return_tensors="pt").to(self.device)
+        t_processor1 = time.time()
+        print(
+            f"InternNav step_s2 processor episode={self.episode_idx} images={len(self.input_images)} "
+            f"input_tokens={int(inputs.input_ids.shape[1])} cost={t_processor1 - t_processor0:.3f}s",
+            file=sys.stderr,
+            flush=True,
+        )
         t0 = time.time()
         with torch.no_grad():
-            outputs = self.model.generate(
+            output_ids = self.model.generate(
                 **inputs,
-                max_new_tokens=128,
+                max_new_tokens=self.max_new_tokens,
                 do_sample=False,
-                # use_cache=True,
-                # past_key_values=self.past_key_values,
-                return_dict_in_generate=True,
+                use_cache=True,
+                return_dict_in_generate=False,
                 # raw_input_ids=copy.deepcopy(inputs.input_ids),
             )
-        output_ids = outputs.sequences
 
         t1 = time.time()
         self.llm_output = self.processor.tokenizer.decode(
             output_ids[0][inputs.input_ids.shape[1] :], skip_special_tokens=True
         )
-        with open(f"{self.save_dir}/llm_output_{self.episode_idx: 04d}.txt", 'w') as f:
+        with open(f"{self.save_dir}/llm_output_{self.episode_idx:04d}.txt", 'w') as f:
             f.write(self.llm_output)
         self.last_output_ids = copy.deepcopy(output_ids[0])
-        self.past_key_values = copy.deepcopy(outputs.past_key_values)
-        print(f"output {self.episode_idx}  {self.llm_output} cost: {t1 - t0}s")
+        self.past_key_values = None
+        print(
+            f"output {self.episode_idx} {self.llm_output!r} generate_cost={t1 - t0:.3f}s "
+            f"max_new_tokens={self.max_new_tokens}",
+            file=sys.stderr,
+            flush=True,
+        )
         if bool(re.search(r'\d', self.llm_output)):
             coord = [int(c) for c in re.findall(r'\d+', self.llm_output)]
             pixel_goal = [int(coord[1]), int(coord[0])]
@@ -246,6 +427,11 @@ class InternVLAN1AsyncAgent:
             t0 = time.time()
             with torch.no_grad():
                 traj_latents = self.model.generate_latents(output_ids, pixel_values, image_grid_thw)
+                print(
+                    f"InternNav generate_latents episode={self.episode_idx} cost={time.time() - t0:.3f}s",
+                    file=sys.stderr,
+                    flush=True,
+                )
                 return None, traj_latents, pixel_goal
 
         else:
