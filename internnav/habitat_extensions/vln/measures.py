@@ -6,11 +6,15 @@ import numpy as np
 from habitat.core.embodied_task import EmbodiedTask, Measure
 from habitat.core.registry import registry
 from habitat.core.simulator import Simulator
-from habitat.core.utils import try_cv2_import
 from habitat.tasks.nav.nav import DistanceToGoal
 from numpy import ndarray
 
-cv2 = try_cv2_import()
+try:
+    from habitat.core.utils import try_cv2_import
+
+    cv2 = try_cv2_import()
+except ImportError:
+    import cv2
 
 
 def euclidean_distance(pos_a: Union[List[float], ndarray], pos_b: Union[List[float], ndarray]) -> float:

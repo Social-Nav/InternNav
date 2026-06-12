@@ -134,9 +134,12 @@ def _load_qwen25_vl_processor(model_path):
 
 def _model_load_kwargs(device):
     if device.type == 'cpu':
+        cpu_dtype_name = os.environ.get('ARENA_INTERNNAV_CPU_DTYPE', 'float32').strip().lower()
+        cpu_dtype = torch.bfloat16 if cpu_dtype_name in {'bf16', 'bfloat16'} else torch.float32
         return {
-            'torch_dtype': torch.float32,
+            'torch_dtype': cpu_dtype,
             'attn_implementation': 'eager',
+            'low_cpu_mem_usage': True,
         }
     try:
         import flash_attn  # noqa: F401
@@ -168,8 +171,8 @@ class InternVLAN1AsyncAgent:
     def __init__(self, args):
         _register_internvla_transformers_classes()
         self.device, self.requested_device, self.runtime_mode = _resolve_runtime_device(args.device)
-        self.save_dir = "test_data/" + datetime.now().strftime("%Y%m%d_%H%M%S")
-        os.makedirs(self.save_dir, exist_ok=True)
+        self._save_root = self._resolve_save_root()
+        self._reset_save_dir()
         self.load_kwargs = _model_load_kwargs(self.device)
         config = InternVLAN1ModelConfig.from_pretrained(args.model_path)
         self.model = InternVLAN1ForCausalLM.from_pretrained(
@@ -189,12 +192,10 @@ class InternVLAN1AsyncAgent:
         self.resize_h = args.resize_h
         self.num_history = args.num_history
         self.PLAN_STEP_GAP = getattr(args, 'plan_step_gap', 4)
-        # Real-time Arena eval only needs the short waypoint/action token span.
-        # The upstream realworld script used 128 generated tokens and also
-        # copied all returned KV cache tensors, which can block the ROS command
-        # path for minutes on the first Isaac frame.  Keep this configurable for
-        # offline debugging, but default to the VLN adapter's short decode.
-        self.max_new_tokens = _env_int('ARENA_INTERNNAV_MAX_NEW_TOKENS', 10, minimum=1, maximum=128)
+        # Keep the default aligned with the official HabitatVlnEvaluator call
+        # path, which decodes up to 128 new tokens.  Runtime deployments can
+        # still lower ARENA_INTERNNAV_MAX_NEW_TOKENS if latency dominates.
+        self.max_new_tokens = _env_int('ARENA_INTERNNAV_MAX_NEW_TOKENS', 128, minimum=1, maximum=128)
 
         prompt = "You are an autonomous navigation assistant. Your task is to <instruction>. Where should you go next to stay on track? Please output the next waypoint's coordinates in the image. Please output STOP when you have successfully completed the task."
         answer = ""
@@ -225,6 +226,10 @@ class InternVLAN1AsyncAgent:
         self.episode_idx = 0
         self.conversation_history = []
         self.llm_output = ""
+        self.last_generated_token_ids = []
+        self.last_digit_groups = []
+        self.last_symbolic_action_seq = []
+        self.last_output_mode = ""
         self.past_key_values = None
         self.last_s2_idx = -100
 
@@ -235,6 +240,18 @@ class InternVLAN1AsyncAgent:
         self.pixel_goal_rgb = None
         self.pixel_goal_depth = None
 
+    def _resolve_save_root(self) -> Path:
+        root = os.environ.get('ARENA_INTERNNAV_SAVE_ROOT', '').strip()
+        if not root:
+            root = os.environ.get('ARENA_INTERNNAV_WORK_DIR', '/tmp/arena_internnav_work').strip()
+        return Path(root).expanduser().resolve()
+
+    def _reset_save_dir(self) -> None:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        save_dir = self._save_root / 'test_data' / timestamp
+        save_dir.mkdir(parents=True, exist_ok=True)
+        self.save_dir = str(save_dir)
+
     def reset(self):
         self.rgb_list = []
         self.depth_list = []
@@ -242,6 +259,10 @@ class InternVLAN1AsyncAgent:
         self.episode_idx = 0
         self.conversation_history = []
         self.llm_output = ""
+        self.last_generated_token_ids = []
+        self.last_digit_groups = []
+        self.last_symbolic_action_seq = []
+        self.last_output_mode = ""
         self.past_key_values = None
 
         self.output_action = None
@@ -249,9 +270,7 @@ class InternVLAN1AsyncAgent:
         self.output_pixel = None
         self.pixel_goal_rgb = None
         self.pixel_goal_depth = None
-
-        self.save_dir = "test_data/" + datetime.now().strftime("%Y%m%d_%H%M%S")
-        os.makedirs(self.save_dir, exist_ok=True)
+        self._reset_save_dir()
 
     def parse_actions(self, output):
         action_patterns = '|'.join(re.escape(action) for action in self.actions2idx)
@@ -327,7 +346,8 @@ class InternVLAN1AsyncAgent:
             self.past_key_values = None
 
             sources = copy.deepcopy(self.conversation)
-            sources[0]["value"] = sources[0]["value"].replace('<instruction>.', instruction)
+            route_instruction = str(instruction or '').strip().rstrip('.')
+            sources[0]["value"] = sources[0]["value"].replace('<instruction>', route_instruction)
             cur_images = self.rgb_list[-1:]
             if self.episode_idx == 0:
                 history_id = []
@@ -409,6 +429,10 @@ class InternVLAN1AsyncAgent:
         self.llm_output = self.processor.tokenizer.decode(
             output_ids[0][inputs.input_ids.shape[1] :], skip_special_tokens=True
         )
+        self.last_generated_token_ids = output_ids[0][inputs.input_ids.shape[1] :].detach().cpu().tolist()
+        self.last_digit_groups = [int(c) for c in re.findall(r'\d+', self.llm_output)]
+        self.last_symbolic_action_seq = []
+        self.last_output_mode = "pixel_goal" if self.last_digit_groups else "symbolic_action"
         with open(f"{self.save_dir}/llm_output_{self.episode_idx:04d}.txt", 'w') as f:
             f.write(self.llm_output)
         self.last_output_ids = copy.deepcopy(output_ids[0])
@@ -420,7 +444,10 @@ class InternVLAN1AsyncAgent:
             flush=True,
         )
         if bool(re.search(r'\d', self.llm_output)):
-            coord = [int(c) for c in re.findall(r'\d+', self.llm_output)]
+            coord = self.last_digit_groups
+            if len(coord) < 2:
+                self.last_output_mode = "invalid_digit_output"
+                return [], None, None
             pixel_goal = [int(coord[1]), int(coord[0])]
             image_grid_thw = torch.cat([thw.unsqueeze(0) for thw in inputs.image_grid_thw], dim=0)
             pixel_values = inputs.pixel_values
@@ -436,6 +463,7 @@ class InternVLAN1AsyncAgent:
 
         else:
             action_seq = self.parse_actions(self.llm_output)
+            self.last_symbolic_action_seq = list(action_seq)
             return action_seq, None, None
 
     def step_s1(self, latent, rgb, depth):

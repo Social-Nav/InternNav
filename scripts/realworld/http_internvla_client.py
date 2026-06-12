@@ -1,7 +1,9 @@
 import copy
+import argparse
 import io
 import json
 import math
+import os
 import threading
 import time
 from collections import deque
@@ -13,7 +15,8 @@ import requests
 from geometry_msgs.msg import Twist
 from nav_msgs.msg import Odometry
 from PIL import Image as PIL_Image
-from sensor_msgs.msg import Image
+from sensor_msgs.msg import CameraInfo, Image
+from std_msgs.msg import Int16, String
 
 frame_data = {}
 frame_idx = 0
@@ -22,7 +25,8 @@ from controllers import Mpc_controller, PID_controller
 from cv_bridge import CvBridge
 from message_filters import ApproximateTimeSynchronizer, Subscriber
 from rclpy.node import Node
-from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
+from rclpy.executors import ExternalShutdownException
+from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from thread_utils import ReadWriteLock
 
 
@@ -42,6 +46,12 @@ last_s2_step = -1
 manager = None
 current_control_mode = ControlMode.MPC_Mode
 trajs_in_world = None
+http_url = 'http://127.0.0.1:5801/eval_dual'
+latest_instruction = ''
+latest_intrinsic = None
+force_look_down = False
+last_readiness_log_time = 0.0
+trace_path = ''
 
 desired_v, desired_w = 0.0, 0.0
 rgb_depth_rw_lock = ReadWriteLock()
@@ -49,9 +59,31 @@ odom_rw_lock = ReadWriteLock()
 mpc_rw_lock = ReadWriteLock()
 
 
-def dual_sys_eval(image_bytes, depth_bytes, front_image_bytes, url='http://127.0.0.1:5801/eval_dual'):
+def dual_sys_eval(
+    image_bytes,
+    depth_bytes,
+    front_image_bytes,
+    url='http://127.0.0.1:5801/eval_dual',
+    *,
+    instruction='',
+    pose=None,
+    camera_pose=None,
+    intrinsic=None,
+    look_down=False,
+    timeout=100,
+):
     global policy_init, http_idx, first_running_time
-    data = {"reset": policy_init, "idx": http_idx}
+    data = {
+        "reset": policy_init,
+        "idx": http_idx,
+        "request_id": http_idx + 1,
+        "instruction": instruction,
+        "pose": pose,
+        "camera_pose": camera_pose,
+        "intrinsic": intrinsic,
+        "look_down": bool(look_down),
+        "client": "internnav_realworld_ros2_http_client",
+    }
     json_data = json.dumps(data)
 
     policy_init = False
@@ -60,7 +92,8 @@ def dual_sys_eval(image_bytes, depth_bytes, front_image_bytes, url='http://127.0
         'depth': ('depth_image', depth_bytes, 'image/png'),
     }
     start = time.time()
-    response = requests.post(url, files=files, data={'json': json_data}, timeout=100)
+    response = requests.post(url, files=files, data={'json': json_data}, timeout=timeout)
+    response.raise_for_status()
     print(f"response {response.text}")
     http_idx += 1
     if http_idx == 0:
@@ -103,8 +136,100 @@ def control_thread():
         time.sleep(0.1)
 
 
+def _reset_policy_state(reason='reset'):
+    global policy_init, mpc, http_idx, first_running_time, last_pixel_goal, last_s2_step
+    global current_control_mode, trajs_in_world, desired_v, desired_w, frame_data
+    policy_init = True
+    mpc = None
+    http_idx = -1
+    first_running_time = 0.0
+    last_pixel_goal = None
+    last_s2_step = -1
+    current_control_mode = ControlMode.PID_Mode
+    trajs_in_world = None
+    desired_v, desired_w = 0.0, 0.0
+    frame_data = {}
+    print(f"official InternNav client reset policy state: {reason}")
+
+
+def _stop_robot(reason='stop'):
+    global mpc, current_control_mode, desired_v, desired_w, trajs_in_world
+    desired_v, desired_w = 0.0, 0.0
+    trajs_in_world = None
+    mpc_rw_lock.acquire_write()
+    try:
+        mpc = None
+    finally:
+        mpc_rw_lock.release_write()
+    current_control_mode = ControlMode.PID_Mode
+    if manager is not None:
+        manager.stop_motion(reason)
+
+
+def _readiness_missing(odom_infer, rgb_bytes, depth_bytes):
+    missing = []
+    if manager is None or not getattr(manager, 'episode_started', False):
+        missing.append('task_reset')
+    if odom_infer is None:
+        missing.append('odom')
+    if rgb_bytes is None:
+        missing.append('rgb')
+    if depth_bytes is None:
+        missing.append('depth')
+    if latest_intrinsic is None:
+        missing.append('camera_info')
+    if not str(latest_instruction or '').strip():
+        missing.append('instruction')
+    return missing
+
+
+def _json_default(value):
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, (np.floating, np.integer)):
+        return value.item()
+    return str(value)
+
+
+def _write_trace(event, **fields):
+    if not trace_path:
+        return
+    record = {
+        'time': time.time(),
+        'event': event,
+        'http_idx': http_idx,
+        'desired_v': desired_v,
+        'desired_w': desired_w,
+        **fields,
+    }
+    try:
+        os.makedirs(os.path.dirname(trace_path) or '.', exist_ok=True)
+        with open(trace_path, 'a', encoding='utf-8') as handle:
+            handle.write(json.dumps(record, default=_json_default, ensure_ascii=False) + '\n')
+    except Exception as exc:
+        print(f"failed to write InternNav client trace: {exc!r}")
+
+
+def _publish_status(status, **debug):
+    if manager is None:
+        return
+    payload = {
+        'status': status,
+        'http_idx': http_idx,
+        'request_cnt': getattr(manager, 'request_cnt', 0),
+        'odom_cnt': getattr(manager, 'odom_cnt', 0),
+        'desired_v': desired_v,
+        'desired_w': desired_w,
+        'control_mode': current_control_mode.name,
+        'policy_init': policy_init,
+        'debug': debug,
+    }
+    manager.publish_status(payload)
+    _write_trace(status, **debug)
+
+
 def planning_thread():
-    global trajs_in_world
+    global trajs_in_world, last_readiness_log_time
 
     while True:
         start_time = time.time()
@@ -135,7 +260,8 @@ def planning_thread():
         # odom_time = manager.odom_timestamp
         odom_rw_lock.release_read()
 
-        if odom_infer is not None and rgb_bytes is not None and depth_bytes is not None:
+        missing = _readiness_missing(odom_infer, rgb_bytes, depth_bytes)
+        if not missing:
             global frame_data
             frame_data[http_idx] = {
                 'infer_rgb': copy.deepcopy(infer_rgb),
@@ -144,12 +270,47 @@ def planning_thread():
             }
             if len(frame_data) > 100:
                 del frame_data[min(frame_data.keys())]
-            response = dual_sys_eval(rgb_bytes, depth_bytes, None)
+            camera_pose = None
+            if odom_infer is not None:
+                x_, y_, yaw_ = odom_infer[0], odom_infer[1], odom_infer[2]
+                camera_pose = [
+                    [float(np.cos(yaw_)), float(-np.sin(yaw_)), 0.0, float(x_)],
+                    [float(np.sin(yaw_)), float(np.cos(yaw_)), 0.0, float(y_)],
+                    [0.0, 0.0, 1.0, 0.0],
+                    [0.0, 0.0, 0.0, 1.0],
+                ]
+            try:
+                _publish_status('inference_started', odom=odom_infer, rgb_time=rgb_time)
+                response = dual_sys_eval(
+                    rgb_bytes,
+                    depth_bytes,
+                    None,
+                    url=http_url,
+                    instruction=latest_instruction,
+                    pose=odom_infer,
+                    camera_pose=camera_pose,
+                    intrinsic=latest_intrinsic,
+                    look_down=force_look_down,
+                )
+            except Exception as exc:
+                print(f"skip planning after HTTP inference error: {exc!r}")
+                _publish_status('exception', error=repr(exc))
+                _stop_robot('http_inference_error')
+                time.sleep(0.5)
+                continue
+
+            manager.publish_model_output(response)
 
             global current_control_mode
             traj_len = 0.0
-            if 'trajectory' in response:
-                trajectory = response['trajectory']
+            if 'trajectory' in response or 'output_trajectory' in response:
+                trajectory = response.get('output_trajectory', response.get('trajectory'))
+                if not trajectory or len(trajectory) <= 3:
+                    print(f"skip invalid/short trajectory response: {trajectory}")
+                    _publish_status('invalid_or_short_trajectory', trajectory=trajectory, raw_response=response)
+                    _stop_robot('invalid_or_short_trajectory')
+                    time.sleep(0.1)
+                    continue
                 trajs_in_world = []
                 odom = odom_infer
                 traj_len = np.linalg.norm(trajectory[-1][:2])
@@ -182,35 +343,64 @@ def planning_thread():
                 manager.request_cnt += 1
                 mpc_rw_lock.release_write()
                 current_control_mode = ControlMode.MPC_Mode
+                _publish_status(
+                    'trajectory',
+                    trajectory_len=len(trajectory),
+                    trajectory_endpoint=trajectory[-1],
+                    trajectory_norm=traj_len,
+                )
             elif 'discrete_action' in response:
                 actions = response['discrete_action']
-                if actions != [5] and actions != [9]:
+                if actions == [0] or actions == 0:
+                    print('official InternNav client received STOP/no-action; publishing zero velocity')
+                    _publish_status('stop', discrete_action=actions, raw_response=response)
+                    _stop_robot('internnav_stop')
+                elif actions != [5] and actions != [9]:
                     manager.incremental_change_goal(actions)
                     current_control_mode = ControlMode.PID_Mode
+                    _publish_status('discrete_action', discrete_action=actions)
+            else:
+                _publish_status('unknown_response', raw_response=response)
         else:
-            print(
-                f"skip planning. odom_infer: {odom_infer is not None} rgb_bytes: {rgb_bytes is not None} depth_bytes: {depth_bytes is not None}"
-            )
+            now = time.time()
+            if now - last_readiness_log_time > 2.0:
+                print(f"skip planning until real inputs are ready; missing={missing}")
+                _publish_status('required_inputs_not_ready', missing_inputs=missing)
+                last_readiness_log_time = now
             time.sleep(0.1)
 
         time.sleep(max(0, DESIRED_TIME - (time.time() - start_time)))
 
 
 class Go2Manager(Node):
-    def __init__(self):
+    def __init__(self, args):
         super().__init__('go2_manager')
 
-        rgb_down_sub = Subscriber(self, Image, "/camera/camera/color/image_raw")
-        depth_down_sub = Subscriber(self, Image, "/camera/camera/aligned_depth_to_color/image_raw")
+        rgb_down_sub = Subscriber(self, Image, args.rgb_topic)
+        depth_down_sub = Subscriber(self, Image, args.depth_topic)
 
         qos_profile = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT, history=HistoryPolicy.KEEP_LAST, depth=10)
 
         self.syncronizer = ApproximateTimeSynchronizer([rgb_down_sub, depth_down_sub], 1, 0.1)
         self.syncronizer.registerCallback(self.rgb_depth_down_callback)
-        self.odom_sub = self.create_subscription(Odometry, "/odom_bridge", self.odom_callback, qos_profile)
+        self.odom_sub = self.create_subscription(Odometry, args.odom_topic, self.odom_callback, qos_profile)
+        instruction_qos = QoSProfile(depth=1)
+        instruction_qos.reliability = ReliabilityPolicy.RELIABLE
+        instruction_qos.durability = DurabilityPolicy.TRANSIENT_LOCAL
+        self.instruction_sub = self.create_subscription(String, args.instruction_topic, self.instruction_callback, instruction_qos)
+        self.camera_info_sub = self.create_subscription(CameraInfo, args.camera_info_topic, self.camera_info_callback, 10)
+        self.task_reset_sub = self.create_subscription(Int16, args.task_reset_topic, self.task_reset_callback, 10)
+        self.scenario_reset_sub = None
+        if args.scenario_reset_topic and args.scenario_reset_topic != args.task_reset_topic:
+            self.scenario_reset_sub = self.create_subscription(Int16, args.scenario_reset_topic, self.task_reset_callback, 10)
 
         # publisher
-        self.control_pub = self.create_publisher(Twist, '/cmd_vel_bridge', 5)
+        self.control_pub = self.create_publisher(Twist, args.cmd_vel_topic, 5)
+        status_qos = QoSProfile(depth=1)
+        status_qos.reliability = ReliabilityPolicy.RELIABLE
+        status_qos.durability = DurabilityPolicy.TRANSIENT_LOCAL
+        self.status_pub = self.create_publisher(String, args.status_topic, status_qos) if args.status_topic else None
+        self.model_output_pub = self.create_publisher(String, args.model_output_topic, 10) if args.model_output_topic else None
 
         # class member variable
         self.cv_bridge = CvBridge()
@@ -238,6 +428,95 @@ class Go2Manager(Node):
         self.homo_odom = None
         self.homo_goal = None
         self.vel = None
+        self.last_instruction = ''
+        self.episode_started = False
+
+        self.publish_status(
+            {
+                'status': 'client_ready',
+                'http_idx': http_idx,
+                'request_cnt': self.request_cnt,
+                'odom_cnt': self.odom_cnt,
+                'desired_v': desired_v,
+                'desired_w': desired_w,
+                'control_mode': current_control_mode.name,
+                'policy_init': policy_init,
+                'debug': {
+                    'ready': True,
+                    'episode_started': self.episode_started,
+                    'rgb_topic': args.rgb_topic,
+                    'depth_topic': args.depth_topic,
+                    'odom_topic': args.odom_topic,
+                    'instruction_topic': args.instruction_topic,
+                    'task_reset_topic': args.task_reset_topic,
+                    'scenario_reset_topic': args.scenario_reset_topic,
+                },
+            }
+        )
+        _write_trace(
+            'client_ready',
+            ready=True,
+            episode_started=self.episode_started,
+            rgb_topic=args.rgb_topic,
+            depth_topic=args.depth_topic,
+            odom_topic=args.odom_topic,
+            instruction_topic=args.instruction_topic,
+            task_reset_topic=args.task_reset_topic,
+            scenario_reset_topic=args.scenario_reset_topic,
+        )
+
+    def reset_runtime_state(self, reason):
+        _reset_policy_state(reason)
+        rgb_depth_rw_lock.acquire_write()
+        try:
+            self.rgb_image = None
+            self.rgb_bytes = None
+            self.depth_image = None
+            self.depth_bytes = None
+            self.rgb_forward_image = None
+            self.rgb_forward_bytes = None
+            self.new_image_arrived = False
+            self.new_vis_image_arrived = False
+            self.rgb_time = 0.0
+        finally:
+            rgb_depth_rw_lock.release_write()
+        odom_rw_lock.acquire_write()
+        try:
+            self.odom = None
+            self.odom_queue.clear()
+            self.odom_timestamp = 0.0
+            self.linear_vel = 0.0
+            self.angular_vel = 0.0
+            self.homo_odom = None
+            self.homo_goal = None
+            self.vel = None
+        finally:
+            odom_rw_lock.release_write()
+        self.request_cnt = 0
+        self.odom_cnt = 0
+        self.last_s2_step = -1
+        self.last_trajs_in_world = None
+        self.last_all_trajs_in_world = None
+        self.stop_motion(reason)
+
+    def stop_motion(self, reason='stop'):
+        self.homo_goal = self.homo_odom.copy() if self.homo_odom is not None else None
+        print(f"publish zero cmd_vel: {reason}")
+        self.move(0.0, 0.0, 0.0)
+
+    def publish_status(self, payload):
+        if self.status_pub is None:
+            return
+        msg = String()
+        msg.data = json.dumps(payload, default=_json_default, ensure_ascii=False)
+        self.status_pub.publish(msg)
+
+    def publish_model_output(self, response):
+        if self.model_output_pub is None:
+            return
+        msg = String()
+        msg.data = json.dumps(response, default=_json_default, ensure_ascii=False)
+        self.model_output_pub.publish(msg)
 
     def rgb_forward_callback(self, rgb_msg):
         raw_image = self.cv_bridge.imgmsg_to_cv2(rgb_msg, 'rgb8')[:, :, :]
@@ -258,10 +537,13 @@ class Go2Manager(Node):
         image.save(image_bytes, format='JPEG')
         image_bytes.seek(0)
 
-        raw_depth = self.cv_bridge.imgmsg_to_cv2(depth_msg, '16UC1')
+        raw_depth = self.cv_bridge.imgmsg_to_cv2(depth_msg, desired_encoding='passthrough')
         raw_depth[np.isnan(raw_depth)] = 0
         raw_depth[np.isinf(raw_depth)] = 0
-        self.depth_image = raw_depth / 1000.0
+        if raw_depth.dtype == np.uint16:
+            self.depth_image = raw_depth.astype(np.float32) / 1000.0
+        else:
+            self.depth_image = raw_depth.astype(np.float32)
         self.depth_image -= 0.0
         self.depth_image[np.where(self.depth_image < 0)] = 0
         depth = (np.clip(self.depth_image * 10000.0, 0, 65535)).astype(np.uint16)
@@ -285,6 +567,35 @@ class Go2Manager(Node):
         self.new_vis_image_arrived = True
         self.new_image_arrived = True
 
+    def instruction_callback(self, msg):
+        global latest_instruction
+        instruction = str(msg.data or '')
+        if instruction and instruction != self.last_instruction:
+            self.last_instruction = instruction
+            latest_instruction = instruction
+            self.reset_runtime_state('instruction_changed')
+        else:
+            latest_instruction = instruction
+
+    def task_reset_callback(self, msg):
+        self.episode_started = True
+        self.reset_runtime_state(f'task_reset:{getattr(msg, "data", "")})')
+        _publish_status(
+            'episode_ready',
+            ready=True,
+            episode_started=self.episode_started,
+            task_reset=getattr(msg, 'data', None),
+        )
+
+    def camera_info_callback(self, msg):
+        global latest_intrinsic
+        if len(msg.k) >= 9:
+            latest_intrinsic = [
+                [float(msg.k[0]), float(msg.k[1]), float(msg.k[2])],
+                [float(msg.k[3]), float(msg.k[4]), float(msg.k[5])],
+                [float(msg.k[6]), float(msg.k[7]), float(msg.k[8])],
+            ]
+
     def odom_callback(self, msg):
         self.odom_cnt += 1
         odom_rw_lock.acquire_write()
@@ -292,8 +603,9 @@ class Go2Manager(Node):
         ww = msg.pose.pose.orientation.w
         yaw = math.atan2(2 * zz * ww, 1 - 2 * zz * zz)
         self.odom = [msg.pose.pose.position.x, msg.pose.pose.position.y, yaw]
-        self.odom_queue.append((time.time(), copy.deepcopy(self.odom)))
-        self.odom_timestamp = time.time()
+        odom_stamp = msg.header.stamp.sec + msg.header.stamp.nanosec / 1.0e9
+        self.odom_queue.append((odom_stamp, copy.deepcopy(self.odom)))
+        self.odom_timestamp = odom_stamp
         self.linear_vel = msg.twist.twist.linear.x
         self.angular_vel = msg.twist.twist.angular.z
         odom_rw_lock.release_write()
@@ -341,15 +653,38 @@ class Go2Manager(Node):
         self.control_pub.publish(request)
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(description='InternVLA-N1 realworld ROS2 HTTP client')
+    parser.add_argument('--url', default='http://127.0.0.1:5801/eval_dual')
+    parser.add_argument('--rgb-topic', default='/camera/camera/color/image_raw')
+    parser.add_argument('--depth-topic', default='/camera/camera/aligned_depth_to_color/image_raw')
+    parser.add_argument('--odom-topic', default='/odom_bridge')
+    parser.add_argument('--cmd-vel-topic', default='/cmd_vel_bridge')
+    parser.add_argument('--instruction-topic', default='/task_generator_node/vln_instruction')
+    parser.add_argument('--camera-info-topic', default='/camera/camera/color/camera_info')
+    parser.add_argument('--task-reset-topic', default='/task_generator_node/task_reset')
+    parser.add_argument('--scenario-reset-topic', default='')
+    parser.add_argument('--status-topic', default='')
+    parser.add_argument('--model-output-topic', default='')
+    parser.add_argument('--trace-path', default='')
+    parser.add_argument('--look-down', action='store_true')
+    args, ros_args = parser.parse_known_args()
+    return args, ros_args
+
+
 if __name__ == '__main__':
+    args, ros_args = parse_args()
+    http_url = args.url
+    force_look_down = bool(args.look_down)
+    trace_path = args.trace_path
     control_thread_instance = threading.Thread(target=control_thread)
     planning_thread_instance = threading.Thread(target=planning_thread)
     control_thread_instance.daemon = True
     planning_thread_instance.daemon = True
-    rclpy.init()
+    rclpy.init(args=ros_args)
 
     try:
-        manager = Go2Manager()
+        manager = Go2Manager(args)
 
         control_thread_instance.start()
         planning_thread_instance.start()
@@ -357,6 +692,9 @@ if __name__ == '__main__':
         rclpy.spin(manager)
     except KeyboardInterrupt:
         pass
+    except ExternalShutdownException:
+        pass
     finally:
         manager.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
