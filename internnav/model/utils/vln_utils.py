@@ -125,9 +125,17 @@ def traj_to_actions(dp_actions, use_discrate_action=True):
 
         return actions
 
-    # unnormalize
-    dp_actions[:, :, :2] /= 4.0
-    all_trajectory = reconstruct_xy_from_delta(dp_actions.float().cpu().numpy())
+    # unnormalize.  Realworld HTTP inference calls this after System-1
+    # generation, where the returned tensor may still carry autograd metadata;
+    # detach before numpy conversion and avoid mutating the model-owned tensor.
+    if isinstance(dp_actions, torch.Tensor):
+        dp_actions = dp_actions.detach().clone().float().cpu()
+        dp_actions[:, :, :2] /= 4.0
+        dp_actions_np = dp_actions.numpy()
+    else:
+        dp_actions_np = np.array(dp_actions, dtype=np.float32, copy=True)
+        dp_actions_np[:, :, :2] /= 4.0
+    all_trajectory = reconstruct_xy_from_delta(dp_actions_np)
     trajectory = np.mean(all_trajectory, axis=0)
     if use_discrate_action:
         actions = trajectory_to_discrete_actions_close_to_goal(trajectory)

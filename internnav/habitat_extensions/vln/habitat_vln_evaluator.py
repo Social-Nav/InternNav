@@ -28,6 +28,7 @@ from habitat.config.default_structured_configs import (
 from habitat.tasks.nav.shortest_path_follower import ShortestPathFollower
 from habitat.utils.visualizations.utils import images_to_video, observations_to_image
 from habitat_baselines.config.default import get_config as get_habitat_config
+from omegaconf import open_dict
 from PIL import Image
 from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
 
@@ -52,7 +53,6 @@ DEFAULT_IMAGE_TOKEN = "<image>"
 MAX_STEPS = 8
 MAX_LOCAL_STEPS = 4
 
-
 class action_code(IntEnum):
     STOP = 0
     FORWARD = 1
@@ -60,6 +60,16 @@ class action_code(IntEnum):
     RIGHT = 3
     LOOKUP = 4
     LOOKDOWN = 5
+
+
+ACTION_NAMES = {
+    action_code.STOP: "STOP",
+    action_code.FORWARD: "FORWARD",
+    action_code.LEFT: "LEFT",
+    action_code.RIGHT: "RIGHT",
+    action_code.LOOKUP: "LOOKUP",
+    action_code.LOOKDOWN: "LOOKDOWN",
+}
 
 
 @Evaluator.register('habitat_vln')
@@ -78,6 +88,10 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         self.sim_sensors_config = self.config.habitat.simulator.agents.main_agent.sim_sensors
 
         with habitat.config.read_write(self.config):
+            with open_dict(self.config.habitat.task.actions.look_up):
+                self.config.habitat.task.actions.look_up.tilt_angle = 15
+            with open_dict(self.config.habitat.task.actions.look_down):
+                self.config.habitat.task.actions.look_down.tilt_angle = 15
             self.config.habitat.task.measurements.update(
                 {
                     "top_down_map": TopDownMapMeasurementConfig(
@@ -241,6 +255,136 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         actions = itertools.chain.from_iterable(actions)
         return list(actions)
 
+    def _json_safe(self, value):
+        if isinstance(value, torch.Tensor):
+            return value.detach().cpu().tolist()
+        if isinstance(value, np.ndarray):
+            return value.tolist()
+        if isinstance(value, np.generic):
+            return value.item()
+        if isinstance(value, IntEnum):
+            return int(value)
+        if isinstance(value, (list, tuple)):
+            return [self._json_safe(v) for v in value]
+        if isinstance(value, dict):
+            return {str(k): self._json_safe(v) for k, v in value.items()}
+        return value
+
+    def _write_raw_output_record(self, record):
+        try:
+            os.makedirs(self.output_path, exist_ok=True)
+            raw_output_path = getattr(self.model_args, "raw_output_path", None)
+            if raw_output_path is None:
+                raw_output_path = os.path.join(self.output_path, f'raw_outputs_rank{self.rank}.jsonl')
+            else:
+                raw_output_path = os.path.expanduser(raw_output_path)
+                if not os.path.isabs(raw_output_path):
+                    raw_output_path = os.path.join(self.output_path, raw_output_path)
+            os.makedirs(os.path.dirname(raw_output_path), exist_ok=True)
+            base_record = {
+                "record_source": "internnav_habitat_vln_ce",
+                "mode": self.model_args.mode,
+                "epoch": self.epoch,
+                "rank": self.rank,
+            }
+            base_record.update(record)
+            with open(raw_output_path, 'a') as f:
+                f.write(json.dumps(self._json_safe(base_record), ensure_ascii=False) + "\n")
+        except Exception as exc:  # keep eval running even if tracing fails
+            print(f"[raw-output-trace] failed to write record: {exc}", flush=True)
+
+    def _draw_text_panel(self, frame, lines, *, origin=(12, 28), font_scale=0.55, line_height=22):
+        """Draw a readable multi-line overlay panel on an RGB frame.
+
+        Habitat videos are used for visual diagnosis, so keep this helper
+        dependency-light and fail-safe.  The input frame is RGB because Habitat
+        / imageio use RGB; OpenCV drawing still works as long as colors are
+        specified in the same channel order we want to see in the output.
+        """
+        if frame is None:
+            return frame
+        safe_lines = [str(line)[:140] for line in lines if line is not None and str(line) != ""]
+        if not safe_lines:
+            return frame
+
+        x, y = origin
+        panel_w = min(frame.shape[1] - 2 * x, 980)
+        panel_h = line_height * len(safe_lines) + 14
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (x - 8, y - 20), (x - 8 + panel_w, y - 20 + panel_h), (0, 0, 0), -1)
+        frame = cv2.addWeighted(overlay, 0.45, frame, 0.55, 0)
+        for idx, line in enumerate(safe_lines):
+            yy = y + idx * line_height
+            cv2.putText(
+                frame,
+                line,
+                (x, yy),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                font_scale,
+                (255, 255, 255),
+                1,
+                cv2.LINE_AA,
+            )
+        return frame
+
+    def _render_ego_debug_frame(
+        self,
+        rgb_image,
+        *,
+        scene_id,
+        episode_id,
+        step_id,
+        action,
+        episode_instruction,
+        generation_trace=None,
+        pixel_goal=None,
+        remaining_symbolic_action_seq=None,
+        remaining_local_actions=None,
+        forward_action_count=0,
+    ):
+        frame = np.asarray(rgb_image).copy()
+        action_int = int(action) if action is not None else -1
+        action_name = (
+            ACTION_NAMES.get(action_code(action_int), str(action_int))
+            if action_int in ACTION_NAMES
+            else str(action_int)
+        )
+        generation_trace = generation_trace or {}
+        raw_output = generation_trace.get("raw_output_text", "")
+        output_mode = generation_trace.get("output_mode", "")
+        digit_groups = generation_trace.get("digit_groups", [])
+        selected_action = generation_trace.get("selected_action_from_generation", None)
+        traj_actions = generation_trace.get("trajectory_actions", [])
+        symbolic_actions = generation_trace.get("symbolic_action_seq", [])
+        short_instruction = " ".join(str(episode_instruction or "").strip().split())[:150]
+
+        lines = [
+            f"scene={scene_id} episode={episode_id:04d} step={step_id} action={action_int}:{action_name}",
+            f"instruction: {short_instruction}",
+            f"raw_output={raw_output!r} mode={output_mode} digits={digit_groups} pixel_goal={pixel_goal}",
+            f"selected={selected_action} symbolic={symbolic_actions} traj={traj_actions}",
+            f"queue_symbolic={list(remaining_symbolic_action_seq or [])} queue_local={list(remaining_local_actions or [])} forward_count={forward_action_count}",
+        ]
+        frame = self._draw_text_panel(frame, lines)
+
+        if pixel_goal is not None and len(pixel_goal) >= 2:
+            px = int(pixel_goal[0])
+            py = int(pixel_goal[1])
+            if 0 <= px < frame.shape[1] and 0 <= py < frame.shape[0]:
+                cv2.circle(frame, (px, py), radius=10, color=(255, 0, 0), thickness=-1)
+                cv2.circle(frame, (px, py), radius=16, color=(255, 255, 255), thickness=2)
+                cv2.putText(
+                    frame,
+                    f"pixel_goal=({px},{py})",
+                    (max(5, px - 80), max(25, py - 18)),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5,
+                    (255, 255, 255),
+                    2,
+                    cv2.LINE_AA,
+                )
+        return frame
+
     def resume_from_output_path(self) -> None:
         sucs, spls, oss, nes, ndtw = [], [], [], [], []
         if self.rank != 0:
@@ -311,10 +455,12 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             action = None
             messages = []
             local_actions = []
+            current_generation_trace = {}
 
             done = False
             flag = False
             pixel_goal = None
+            forward_action = 0
 
             # ---------- 2. Episode step loop -----------
             while (not done) and (step_id <= self.max_steps_per_episode):
@@ -427,13 +573,21 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     llm_outputs = self.processor.tokenizer.decode(
                         output_ids[0][inputs.input_ids.shape[1] :], skip_special_tokens=True
                     )
+                    generated_token_ids = output_ids[0][inputs.input_ids.shape[1] :].detach().cpu().tolist()
+                    digit_groups = [int(c) for c in re.findall(r'\d+', llm_outputs)]
+                    trace_output_mode = "pixel_goal" if digit_groups else "symbolic_action"
+                    trace_pixel_goal = None
+                    trace_action_seq = []
+                    trace_traj_actions = []
+                    trace_selected_action = None
                     print('step_id:', step_id, 'output text:', llm_outputs)
 
                     if bool(re.search(r'\d', llm_outputs)):  # output pixel goal
                         forward_action = 0
-                        coord = [int(c) for c in re.findall(r'\d+', llm_outputs)]
+                        coord = digit_groups
 
                         pixel_goal = [int(coord[1]), int(coord[0])]
+                        trace_pixel_goal = list(pixel_goal)
                         draw_pixel_goal = True
 
                         # look down --> horizontal
@@ -465,8 +619,27 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                         local_actions = action_list
                         if len(local_actions) >= MAX_LOCAL_STEPS:
                             local_actions = local_actions[:MAX_LOCAL_STEPS]
+                        trace_traj_actions = list(local_actions)
 
                         action = local_actions[0]
+                        trace_selected_action = int(action)
+                        current_generation_trace = {
+                            "record_type": "model_generation",
+                            "scene_id": scene_id,
+                            "episode_id": episode_id,
+                            "episode_instruction": episode_instruction,
+                            "step_id": step_id,
+                            "raw_output_text": llm_outputs,
+                            "generated_token_ids": generated_token_ids,
+                            "digit_groups": digit_groups,
+                            "output_mode": trace_output_mode,
+                            "pixel_goal": trace_pixel_goal,
+                            "symbolic_action_seq": trace_action_seq,
+                            "trajectory_actions": trace_traj_actions,
+                            "selected_action_from_generation": trace_selected_action,
+                            "input_image_count": len(input_images),
+                        }
+                        self._write_raw_output_record(current_generation_trace)
                         if action == action_code.STOP:
                             pixel_goal = None
                             output_ids = None
@@ -479,6 +652,25 @@ class HabitatVLNEvaluator(DistributedEvaluator):
 
                     else:
                         action_seq = self.parse_actions(llm_outputs)
+                        trace_action_seq = list(action_seq)
+                        trace_selected_action = action_seq[0] if len(action_seq) > 0 else None
+                        current_generation_trace = {
+                            "record_type": "model_generation",
+                            "scene_id": scene_id,
+                            "episode_id": episode_id,
+                            "episode_instruction": episode_instruction,
+                            "step_id": step_id,
+                            "raw_output_text": llm_outputs,
+                            "generated_token_ids": generated_token_ids,
+                            "digit_groups": digit_groups,
+                            "output_mode": trace_output_mode,
+                            "pixel_goal": trace_pixel_goal,
+                            "symbolic_action_seq": trace_action_seq,
+                            "trajectory_actions": trace_traj_actions,
+                            "selected_action_from_generation": trace_selected_action,
+                            "input_image_count": len(input_images),
+                        }
+                        self._write_raw_output_record(current_generation_trace)
                         print('actions', action_seq, flush=True)
 
                 if len(action_seq) != 0:
@@ -538,21 +730,35 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     vis_frames.append(frame)
 
                 print("step_id", step_id, "action", action)
+                self._write_raw_output_record(
+                    {
+                        "record_type": "env_action_step",
+                        "scene_id": scene_id,
+                        "episode_id": episode_id,
+                        "episode_instruction": episode_instruction,
+                        "step_id": step_id,
+                        "action": int(action),
+                        "pixel_goal": pixel_goal,
+                        "remaining_symbolic_action_seq": list(action_seq),
+                        "remaining_local_actions": list(local_actions),
+                        "forward_action_count": forward_action,
+                    }
+                )
 
                 if vis_writer is not None:
-                    vis = np.asarray(save_raw_image).copy()
-                    vis = cv2.putText(
-                        vis,
-                        f"step {step_id} action {int(action)}",
-                        (20, 40),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        1,
-                        (0, 255, 0),
-                        2,
+                    vis = self._render_ego_debug_frame(
+                        save_raw_image,
+                        scene_id=scene_id,
+                        episode_id=episode_id,
+                        step_id=step_id,
+                        action=action,
+                        episode_instruction=episode_instruction,
+                        generation_trace=current_generation_trace,
+                        pixel_goal=pixel_goal,
+                        remaining_symbolic_action_seq=action_seq,
+                        remaining_local_actions=local_actions,
+                        forward_action_count=forward_action,
                     )
-                    if pixel_goal is not None:
-                        if draw_pixel_goal:
-                            cv2.circle(vis, (pixel_goal[0], pixel_goal[1]), radius=8, color=(255, 0, 0), thickness=-1)
                     vis_writer.append_data(vis)
 
                 if action == action_code.LOOKDOWN:
@@ -693,8 +899,10 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             output_ids = None
             llm_outputs = ""
             goal = None
+            pixel_goal = None
             action = None
             messages = []
+            forward_action = 0
 
             done = False
             flag = False
@@ -788,13 +996,21 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     llm_outputs = self.processor.tokenizer.decode(
                         output_ids[0][inputs.input_ids.shape[1] :], skip_special_tokens=True
                     )
+                    generated_token_ids = output_ids[0][inputs.input_ids.shape[1] :].detach().cpu().tolist()
+                    digit_groups = [int(c) for c in re.findall(r'\d+', llm_outputs)]
+                    trace_output_mode = "pixel_goal" if digit_groups else "symbolic_action"
+                    trace_pixel_goal = None
+                    trace_goal = None
+                    trace_action_seq = []
+                    trace_selected_action = None
                     print('step_id:', step_id, 'output text:', llm_outputs)
 
                     if bool(re.search(r'\d', llm_outputs)):  # output pixel goal
                         forward_action = 0
-                        coord = [int(c) for c in re.findall(r'\d+', llm_outputs)]
+                        coord = digit_groups
 
                         pixel_goal = [int(coord[1]), int(coord[0])]
+                        trace_pixel_goal = list(pixel_goal)
                         draw_pixel_goal = True
 
                         # look down --> horizontal
@@ -807,8 +1023,28 @@ class HabitatVLNEvaluator(DistributedEvaluator):
 
                         if not self.env._env.sim.pathfinder.is_navigable(np.array(goal)):
                             goal = np.array(self.env._env.sim.pathfinder.snap_point(np.array(goal)))
+                        trace_goal = goal
 
                         action = agent.get_next_action(goal)
+                        trace_selected_action = action
+                        self._write_raw_output_record(
+                            {
+                                "record_type": "model_generation",
+                                "scene_id": scene_id,
+                                "episode_id": episode_id,
+                                "episode_instruction": episode_instruction,
+                                "step_id": step_id,
+                                "raw_output_text": llm_outputs,
+                                "generated_token_ids": generated_token_ids,
+                                "digit_groups": digit_groups,
+                                "output_mode": trace_output_mode,
+                                "pixel_goal": trace_pixel_goal,
+                                "gps_goal": trace_goal,
+                                "symbolic_action_seq": trace_action_seq,
+                                "selected_action_from_generation": trace_selected_action,
+                                "input_image_count": len(input_images),
+                            }
+                        )
                         if action == action_code.STOP:
                             goal = None
                             output_ids = None
@@ -821,6 +1057,26 @@ class HabitatVLNEvaluator(DistributedEvaluator):
 
                     else:
                         action_seq = self.parse_actions(llm_outputs)
+                        trace_action_seq = list(action_seq)
+                        trace_selected_action = action_seq[0] if len(action_seq) > 0 else None
+                        self._write_raw_output_record(
+                            {
+                                "record_type": "model_generation",
+                                "scene_id": scene_id,
+                                "episode_id": episode_id,
+                                "episode_instruction": episode_instruction,
+                                "step_id": step_id,
+                                "raw_output_text": llm_outputs,
+                                "generated_token_ids": generated_token_ids,
+                                "digit_groups": digit_groups,
+                                "output_mode": trace_output_mode,
+                                "pixel_goal": trace_pixel_goal,
+                                "gps_goal": trace_goal,
+                                "symbolic_action_seq": trace_action_seq,
+                                "selected_action_from_generation": trace_selected_action,
+                                "input_image_count": len(input_images),
+                            }
+                        )
                         print('actions', action_seq, flush=True)
 
                 if len(action_seq) != 0:
@@ -858,6 +1114,20 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     vis_frames.append(frame)
 
                 print("step_id", step_id, "action", action)
+                self._write_raw_output_record(
+                    {
+                        "record_type": "env_action_step",
+                        "scene_id": scene_id,
+                        "episode_id": episode_id,
+                        "episode_instruction": episode_instruction,
+                        "step_id": step_id,
+                        "action": int(action),
+                        "pixel_goal": pixel_goal,
+                        "gps_goal": goal,
+                        "remaining_symbolic_action_seq": list(action_seq),
+                        "forward_action_count": forward_action,
+                    }
+                )
 
                 if vis_writer is not None:
                     vis = np.asarray(save_raw_image).copy()

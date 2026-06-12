@@ -64,6 +64,7 @@ class HabitatEnv(base.Env):
                         done_res.add((res["scene_id"], res["episode_id"]))
 
         # iterate scenes in order, collect all episodes
+        max_episodes = self.env_config.env_settings.get('max_episodes')
         for scene in sorted(scene_episode_dict.keys()):
             per_scene_eps = scene_episode_dict[scene]
             scene_id = scene.split('/')[-2]
@@ -74,6 +75,8 @@ class HabitatEnv(base.Env):
                 if (scene_id, episode_id) in done_res:
                     continue
                 all_episodes.append(episode)
+                if max_episodes is not None and len(all_episodes) >= int(max_episodes):
+                    return all_episodes
 
         return all_episodes
 
