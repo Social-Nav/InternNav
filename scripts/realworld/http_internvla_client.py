@@ -12,7 +12,7 @@ from enum import Enum
 import numpy as np
 import rclpy
 import requests
-from geometry_msgs.msg import Twist
+from geometry_msgs.msg import PoseStamped, Twist
 from nav_msgs.msg import Odometry
 from PIL import Image as PIL_Image
 from sensor_msgs.msg import CameraInfo, Image
@@ -107,6 +107,13 @@ def control_thread():
     global desired_v, desired_w
     while True:
         global current_control_mode
+        if manager is None or not getattr(manager, 'episode_started', False):
+            if desired_v != 0.0 or desired_w != 0.0:
+                desired_v, desired_w = 0.0, 0.0
+                manager.move(0.0, 0.0, 0.0)
+            time.sleep(0.1)
+            continue
+
         if current_control_mode == ControlMode.MPC_Mode:
             odom_rw_lock.acquire_read()
             odom = manager.odom.copy() if manager.odom else None
@@ -169,7 +176,7 @@ def _stop_robot(reason='stop'):
 def _readiness_missing(odom_infer, rgb_bytes, depth_bytes):
     missing = []
     if manager is None or not getattr(manager, 'episode_started', False):
-        missing.append('task_reset')
+        missing.append('eval_ready_episode')
     if odom_infer is None:
         missing.append('odom')
     if rgb_bytes is None:
@@ -389,6 +396,19 @@ class Go2Manager(Node):
         instruction_qos.durability = DurabilityPolicy.TRANSIENT_LOCAL
         self.instruction_sub = self.create_subscription(String, args.instruction_topic, self.instruction_callback, instruction_qos)
         self.camera_info_sub = self.create_subscription(CameraInfo, args.camera_info_topic, self.camera_info_callback, 10)
+        goal_qos = QoSProfile(depth=1)
+        goal_qos.reliability = ReliabilityPolicy.RELIABLE
+        goal_qos.durability = DurabilityPolicy.TRANSIENT_LOCAL
+        self.navigation_goal_sub = self.create_subscription(
+            PoseStamped,
+            args.navigation_goal_topic,
+            self.navigation_goal_callback,
+            goal_qos,
+        )
+        eval_ready_qos = QoSProfile(depth=1)
+        eval_ready_qos.reliability = ReliabilityPolicy.RELIABLE
+        eval_ready_qos.durability = DurabilityPolicy.TRANSIENT_LOCAL
+        self.eval_ready_sub = self.create_subscription(String, args.eval_ready_topic, self.eval_ready_callback, eval_ready_qos)
         self.task_reset_sub = self.create_subscription(Int16, args.task_reset_topic, self.task_reset_callback, 10)
         self.scenario_reset_sub = None
         if args.scenario_reset_topic and args.scenario_reset_topic != args.task_reset_topic:
@@ -430,6 +450,7 @@ class Go2Manager(Node):
         self.vel = None
         self.last_instruction = ''
         self.episode_started = False
+        self.eval_ready_episode = None
 
         self.publish_status(
             {
@@ -450,6 +471,8 @@ class Go2Manager(Node):
                     'instruction_topic': args.instruction_topic,
                     'task_reset_topic': args.task_reset_topic,
                     'scenario_reset_topic': args.scenario_reset_topic,
+                    'navigation_goal_topic': args.navigation_goal_topic,
+                    'eval_ready_topic': args.eval_ready_topic,
                 },
             }
         )
@@ -463,6 +486,8 @@ class Go2Manager(Node):
             instruction_topic=args.instruction_topic,
             task_reset_topic=args.task_reset_topic,
             scenario_reset_topic=args.scenario_reset_topic,
+            navigation_goal_topic=args.navigation_goal_topic,
+            eval_ready_topic=args.eval_ready_topic,
         )
 
     def reset_runtime_state(self, reason):
@@ -578,14 +603,64 @@ class Go2Manager(Node):
             latest_instruction = instruction
 
     def task_reset_callback(self, msg):
-        self.episode_started = True
+        reset_episode = getattr(msg, 'data', None)
+        # /task_reset and /eval_ready are published back-to-back by Arena on
+        # different subscriptions.  DDS can deliver eval_ready(stage=episode,
+        # ready=true) before the matching task_reset sample.  In that ordering,
+        # clearing episode_started here leaves the client permanently gated
+        # until the next episode.  Treat a task_reset for the already-ready
+        # episode as a late boundary notification and keep the ready state.
+        if self.episode_started and self.eval_ready_episode == reset_episode:
+            _publish_status(
+                'task_reset_after_episode_ready',
+                ready=True,
+                episode_started=True,
+                task_reset=reset_episode,
+            )
+            return
+
+        self.episode_started = False
         self.reset_runtime_state(f'task_reset:{getattr(msg, "data", "")})')
         _publish_status(
-            'episode_ready',
+            'resetting',
+            ready=False,
+            episode_started=self.episode_started,
+            task_reset=reset_episode,
+        )
+
+    def navigation_goal_callback(self, msg):
+        if not self.episode_started:
+            return
+        _publish_status(
+            'navigation_goal_seen',
             ready=True,
             episode_started=self.episode_started,
-            task_reset=getattr(msg, 'data', None),
+            goal={
+                'x': float(msg.pose.position.x),
+                'y': float(msg.pose.position.y),
+            },
         )
+
+    def eval_ready_callback(self, msg):
+        try:
+            payload = json.loads(msg.data or '{}')
+        except Exception:
+            return
+        if payload.get('stage') != 'episode':
+            return
+        ready = bool(payload.get('ready'))
+        episode = payload.get('episode')
+        reason = str((payload.get('details') or {}).get('reason', ''))
+        if not ready:
+            self.episode_started = False
+            self.eval_ready_episode = None
+            self.reset_runtime_state(f'eval_ready:false:{reason}')
+            _publish_status('resetting', ready=False, episode_started=False, reason=reason, episode=episode)
+            return
+        self.reset_runtime_state(f'eval_ready:true:{reason}')
+        self.eval_ready_episode = episode
+        self.episode_started = True
+        _publish_status('episode_ready', ready=True, episode_started=True, reason=reason, episode=episode)
 
     def camera_info_callback(self, msg):
         global latest_intrinsic
@@ -662,6 +737,8 @@ def parse_args():
     parser.add_argument('--cmd-vel-topic', default='/cmd_vel_bridge')
     parser.add_argument('--instruction-topic', default='/task_generator_node/vln_instruction')
     parser.add_argument('--camera-info-topic', default='/camera/camera/color/camera_info')
+    parser.add_argument('--navigation-goal-topic', default='/task_generator_node/Ai2_Bot2/episode_goal_pose')
+    parser.add_argument('--eval-ready-topic', default='/task_generator_node/eval_ready')
     parser.add_argument('--task-reset-topic', default='/task_generator_node/task_reset')
     parser.add_argument('--scenario-reset-topic', default='')
     parser.add_argument('--status-topic', default='')
