@@ -15,6 +15,7 @@ import requests
 from geometry_msgs.msg import PoseStamped, Twist
 from nav_msgs.msg import Odometry
 from PIL import Image as PIL_Image
+from PIL import ImageDraw
 from sensor_msgs.msg import CameraInfo, Image
 from std_msgs.msg import Int16, String
 
@@ -52,6 +53,7 @@ latest_intrinsic = None
 force_look_down = False
 last_readiness_log_time = 0.0
 trace_path = ''
+last_overlay_publish_time = 0.0
 
 desired_v, desired_w = 0.0, 0.0
 rgb_depth_rw_lock = ReadWriteLock()
@@ -235,6 +237,132 @@ def _publish_status(status, **debug):
     _write_trace(status, **debug)
 
 
+def _short_json(value, limit=96):
+    try:
+        text = json.dumps(value, default=_json_default, ensure_ascii=False)
+    except Exception:
+        text = str(value)
+    return text if len(text) <= limit else text[: max(0, limit - 3)] + '...'
+
+
+def _action_label(actions):
+    if actions is None:
+        return 'none'
+    labels = {0: 'STOP', 1: 'FORWARD', 2: 'TURN_LEFT', 3: 'TURN_RIGHT', 5: 'NOOP', 9: 'NOOP'}
+    if isinstance(actions, (list, tuple)):
+        return '[' + ', '.join(labels.get(int(a), str(a)) for a in actions if isinstance(a, (int, float, np.integer, np.floating))) + ']'
+    try:
+        return labels.get(int(actions), str(actions))
+    except Exception:
+        return str(actions)
+
+
+def _extract_xy_pairs(values):
+    points = []
+    if not isinstance(values, (list, tuple)):
+        return points
+    for item in values:
+        if isinstance(item, (list, tuple)) and len(item) >= 2:
+            try:
+                points.append((float(item[0]), float(item[1])))
+            except Exception:
+                continue
+    return points
+
+
+def _draw_polyline(draw, points, origin, scale, color, width=3):
+    if len(points) < 2:
+        return
+    projected = []
+    ox, oy = origin
+    for x, y in points:
+        # Robot frame: +x forward. Draw forward upward and +y to the left.
+        projected.append((int(ox - y * scale), int(oy - x * scale)))
+    try:
+        draw.line(projected, fill=color, width=width)
+        for px, py in projected[-3:]:
+            draw.ellipse((px - 3, py - 3, px + 3, py + 3), fill=color)
+    except Exception:
+        pass
+
+
+def _publish_debug_overlay(response, *, odom_infer=None, rgb_image=None, trajectory=None, mode='unknown'):
+    global last_overlay_publish_time
+    if manager is None or manager.debug_overlay_pub is None:
+        return
+    now = time.time()
+    min_period = 1.0 / max(float(getattr(manager, 'visualization_rate_hz', 5.0) or 5.0), 0.1)
+    if now - last_overlay_publish_time < min_period:
+        return
+    if rgb_image is None:
+        return
+
+    try:
+        base = np.asarray(rgb_image, dtype=np.uint8)
+        image = PIL_Image.fromarray(base).convert('RGB')
+        draw = ImageDraw.Draw(image, 'RGBA')
+        width, height = image.size
+        panel_h = 132
+        draw.rectangle((0, 0, width, panel_h), fill=(0, 0, 0, 184), outline=(0, 220, 255, 255), width=2)
+
+        debug = response.get('debug') if isinstance(response, dict) else {}
+        trajectory_points = _extract_xy_pairs(trajectory or response.get('output_trajectory') or response.get('trajectory')) if isinstance(response, dict) else []
+        discrete_action = response.get('discrete_action') if isinstance(response, dict) else None
+        pixel_goal = response.get('output_pixel', response.get('pixel_goal')) if isinstance(response, dict) else None
+
+        lines = [
+            'InternNav real HTTP async agent overlay',
+            f"System-1/action: mode={mode} control={current_control_mode.name} v={desired_v:.3f} w={desired_w:.3f}",
+            f"System-1/traj: len={len(trajectory_points)} endpoint={_short_json(trajectory_points[-1] if trajectory_points else None, 64)}",
+            f"System-2/output: discrete={_action_label(discrete_action)} pixel={_short_json(pixel_goal, 64)}",
+            f"HTTP idx={http_idx} request_cnt={getattr(manager, 'request_cnt', 0)} server={float((debug or {}).get('server_compute_sec') or 0.0):.2f}s",
+        ]
+        if debug and debug.get('llm_output'):
+            lines.append('LLM: ' + str(debug.get('llm_output'))[:110])
+        if debug:
+            lines.append(
+                'pending: '
+                f"S1_latent={bool(debug.get('system1_output_latent_pending'))} "
+                f"S1_action={bool(debug.get('system1_output_action_pending'))} "
+                f"S2_ep={debug.get('system2_episode_idx')}"
+            )
+        for idx, line in enumerate(lines[:7]):
+            draw.text((12, 10 + idx * 18), line, fill=(255, 255, 255, 255))
+
+        # Draw the latest System-1 local trajectory in a small robot-frame inset.
+        inset = (width - 170, panel_h + 10, width - 10, panel_h + 170)
+        draw.rectangle(inset, fill=(0, 0, 0, 148), outline=(255, 200, 0, 255), width=2)
+        cx = (inset[0] + inset[2]) // 2
+        cy = inset[3] - 18
+        draw.line((cx, inset[1] + 10, cx, inset[3] - 8), fill=(80, 80, 80, 255), width=1)
+        draw.line((inset[0] + 10, cy, inset[2] - 10, cy), fill=(80, 80, 80, 255), width=1)
+        draw.polygon([(cx, cy - 10), (cx - 7, cy + 7), (cx + 7, cy + 7)], fill=(255, 80, 80, 255))
+        draw.text((inset[0] + 8, inset[1] + 6), 'S1 traj', fill=(255, 220, 0, 255))
+        _draw_polyline(draw, trajectory_points, (cx, cy), 28.0, (0, 220, 255, 255), width=3)
+
+        if pixel_goal and isinstance(pixel_goal, (list, tuple)) and len(pixel_goal) >= 2:
+            try:
+                px, py = float(pixel_goal[0]), float(pixel_goal[1])
+                # Accept normalized [0,1] or image-space pixel coordinates.
+                if 0.0 <= px <= 1.0 and 0.0 <= py <= 1.0:
+                    px, py = px * width, py * height
+                draw.ellipse((px - 8, py - 8, px + 8, py + 8), outline=(255, 255, 0, 255), width=3)
+                draw.line((px - 14, py, px + 14, py), fill=(255, 255, 0, 255), width=2)
+                draw.line((px, py - 14, px, py + 14), fill=(255, 255, 0, 255), width=2)
+            except Exception:
+                pass
+
+        msg = manager.cv_bridge.cv2_to_imgmsg(np.asarray(image, dtype=np.uint8), encoding='rgb8')
+        msg.header.stamp = manager.get_clock().now().to_msg()
+        msg.header.frame_id = 'internnav_debug_overlay'
+        manager.debug_overlay_pub.publish(msg)
+        if manager.action_overlay_pub is not None:
+            manager.action_overlay_pub.publish(msg)
+        last_overlay_publish_time = now
+    except Exception as exc:
+        print(f"failed to publish InternNav debug overlay: {exc!r}")
+
+
 def planning_thread():
     global trajs_in_world, last_readiness_log_time
 
@@ -350,6 +478,13 @@ def planning_thread():
                 manager.request_cnt += 1
                 mpc_rw_lock.release_write()
                 current_control_mode = ControlMode.MPC_Mode
+                _publish_debug_overlay(
+                    response,
+                    odom_infer=odom_infer,
+                    rgb_image=infer_rgb,
+                    trajectory=trajectory,
+                    mode='trajectory',
+                )
                 _publish_status(
                     'trajectory',
                     trajectory_len=len(trajectory),
@@ -360,13 +495,34 @@ def planning_thread():
                 actions = response['discrete_action']
                 if actions == [0] or actions == 0:
                     print('official InternNav client received STOP/no-action; publishing zero velocity')
+                    _publish_debug_overlay(
+                        response,
+                        odom_infer=odom_infer,
+                        rgb_image=infer_rgb,
+                        trajectory=None,
+                        mode='stop',
+                    )
                     _publish_status('stop', discrete_action=actions, raw_response=response)
                     _stop_robot('internnav_stop')
                 elif actions != [5] and actions != [9]:
                     manager.incremental_change_goal(actions)
                     current_control_mode = ControlMode.PID_Mode
+                    _publish_debug_overlay(
+                        response,
+                        odom_infer=odom_infer,
+                        rgb_image=infer_rgb,
+                        trajectory=None,
+                        mode='discrete_action',
+                    )
                     _publish_status('discrete_action', discrete_action=actions)
             else:
+                _publish_debug_overlay(
+                    response,
+                    odom_infer=odom_infer,
+                    rgb_image=infer_rgb,
+                    trajectory=None,
+                    mode='unknown_response',
+                )
                 _publish_status('unknown_response', raw_response=response)
         else:
             now = time.time()
@@ -421,6 +577,13 @@ class Go2Manager(Node):
         status_qos.durability = DurabilityPolicy.TRANSIENT_LOCAL
         self.status_pub = self.create_publisher(String, args.status_topic, status_qos) if args.status_topic else None
         self.model_output_pub = self.create_publisher(String, args.model_output_topic, 10) if args.model_output_topic else None
+        self.visualization_rate_hz = max(float(args.visualization_rate_hz), 0.1)
+        self.debug_overlay_pub = None
+        self.action_overlay_pub = None
+        if args.enable_visualization and args.visualization_topic:
+            self.debug_overlay_pub = self.create_publisher(Image, args.visualization_topic, 10)
+        if args.enable_visualization and args.action_visualization_topic:
+            self.action_overlay_pub = self.create_publisher(Image, args.action_visualization_topic, 10)
 
         # class member variable
         self.cv_bridge = CvBridge()
@@ -473,6 +636,9 @@ class Go2Manager(Node):
                     'scenario_reset_topic': args.scenario_reset_topic,
                     'navigation_goal_topic': args.navigation_goal_topic,
                     'eval_ready_topic': args.eval_ready_topic,
+                    'visualization_topic': args.visualization_topic,
+                    'action_visualization_topic': args.action_visualization_topic,
+                    'visualization_rate_hz': self.visualization_rate_hz,
                 },
             }
         )
@@ -488,6 +654,9 @@ class Go2Manager(Node):
             scenario_reset_topic=args.scenario_reset_topic,
             navigation_goal_topic=args.navigation_goal_topic,
             eval_ready_topic=args.eval_ready_topic,
+            visualization_topic=args.visualization_topic,
+            action_visualization_topic=args.action_visualization_topic,
+            visualization_rate_hz=self.visualization_rate_hz,
         )
 
     def reset_runtime_state(self, reason):
@@ -743,6 +912,12 @@ def parse_args():
     parser.add_argument('--scenario-reset-topic', default='')
     parser.add_argument('--status-topic', default='')
     parser.add_argument('--model-output-topic', default='')
+    parser.add_argument('--visualization-topic', default='')
+    parser.add_argument('--action-visualization-topic', default='')
+    parser.add_argument('--visualization-rate-hz', type=float, default=5.0)
+    parser.add_argument('--enable-visualization', action='store_true')
+    parser.add_argument('--disable-visualization', dest='enable_visualization', action='store_false')
+    parser.set_defaults(enable_visualization=False)
     parser.add_argument('--trace-path', default='')
     parser.add_argument('--look-down', action='store_true')
     args, ros_args = parser.parse_known_args()
