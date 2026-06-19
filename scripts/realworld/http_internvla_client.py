@@ -48,6 +48,7 @@ manager = None
 current_control_mode = ControlMode.MPC_Mode
 trajs_in_world = None
 http_url = 'http://127.0.0.1:5801/eval_dual'
+planning_period_sec = 0.3
 latest_instruction = ''
 latest_intrinsic = None
 force_look_down = False
@@ -105,6 +106,21 @@ def dual_sys_eval(
     return json.loads(response.text)
 
 
+def _classify_dual_system_response(response):
+    if not isinstance(response, dict):
+        return 'unknown'
+    has_trajectory = 'trajectory' in response or 'output_trajectory' in response
+    has_pixel = 'pixel_goal' in response or 'output_pixel' in response
+    has_discrete = 'discrete_action' in response
+    if has_trajectory and has_pixel:
+        return 'system2_with_system1_trajectory'
+    if has_trajectory:
+        return 'system1_trajectory'
+    if has_discrete:
+        return 'system2_discrete_action'
+    return 'unknown'
+
+
 def control_thread():
     global desired_v, desired_w
     while True:
@@ -141,6 +157,15 @@ def control_thread():
                     v = 0.0
                 desired_v, desired_w = v, w
                 manager.move(v, 0.0, w)
+
+        _write_trace(
+            'control_tick',
+            episode_started=bool(getattr(manager, 'episode_started', False)) if manager is not None else False,
+            control_mode=current_control_mode.name,
+            odom_cnt=int(getattr(manager, 'odom_cnt', 0)) if manager is not None else 0,
+            request_cnt=int(getattr(manager, 'request_cnt', 0)) if manager is not None else 0,
+            has_mpc=mpc is not None,
+        )
 
         time.sleep(0.1)
 
@@ -368,7 +393,7 @@ def planning_thread():
 
     while True:
         start_time = time.time()
-        DESIRED_TIME = 0.3
+        desired_time = max(float(planning_period_sec), 0.01)
         time.sleep(0.05)
 
         if not manager.new_image_arrived:
@@ -415,7 +440,14 @@ def planning_thread():
                     [0.0, 0.0, 0.0, 1.0],
                 ]
             try:
-                _publish_status('inference_started', odom=odom_infer, rgb_time=rgb_time)
+                next_request_id = http_idx + 1
+                _publish_status(
+                    'planning_request_started',
+                    request_id=next_request_id,
+                    planning_period_sec=desired_time,
+                    odom=odom_infer,
+                    rgb_time=rgb_time,
+                )
                 response = dual_sys_eval(
                     rgb_bytes,
                     depth_bytes,
@@ -426,6 +458,22 @@ def planning_thread():
                     camera_pose=camera_pose,
                     intrinsic=latest_intrinsic,
                     look_down=force_look_down,
+                )
+                response_kind = _classify_dual_system_response(response)
+                debug = response.get('debug', {}) if isinstance(response, dict) else {}
+                _write_trace(
+                    'planning_response_received',
+                    request_id=next_request_id,
+                    planning_period_sec=desired_time,
+                    elapsed_sec=time.time() - start_time,
+                    response_kind=response_kind,
+                    system2_episode_idx=debug.get('system2_episode_idx') if isinstance(debug, dict) else None,
+                    system1_output_latent_pending=debug.get('system1_output_latent_pending')
+                    if isinstance(debug, dict)
+                    else None,
+                    system1_output_action_pending=debug.get('system1_output_action_pending')
+                    if isinstance(debug, dict)
+                    else None,
                 )
             except Exception as exc:
                 print(f"skip planning after HTTP inference error: {exc!r}")
@@ -532,26 +580,25 @@ def planning_thread():
                 last_readiness_log_time = now
             time.sleep(0.1)
 
-        time.sleep(max(0, DESIRED_TIME - (time.time() - start_time)))
+        time.sleep(max(0, desired_time - (time.time() - start_time)))
 
 
 class Go2Manager(Node):
     def __init__(self, args):
         super().__init__('go2_manager')
 
-        rgb_down_sub = Subscriber(self, Image, args.rgb_topic)
-        depth_down_sub = Subscriber(self, Image, args.depth_topic)
-
-        qos_profile = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT, history=HistoryPolicy.KEEP_LAST, depth=10)
+        sensor_qos = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT, history=HistoryPolicy.KEEP_LAST, depth=10)
+        rgb_down_sub = Subscriber(self, Image, args.rgb_topic, qos_profile=sensor_qos)
+        depth_down_sub = Subscriber(self, Image, args.depth_topic, qos_profile=sensor_qos)
 
         self.syncronizer = ApproximateTimeSynchronizer([rgb_down_sub, depth_down_sub], 1, 0.1)
         self.syncronizer.registerCallback(self.rgb_depth_down_callback)
-        self.odom_sub = self.create_subscription(Odometry, args.odom_topic, self.odom_callback, qos_profile)
+        self.odom_sub = self.create_subscription(Odometry, args.odom_topic, self.odom_callback, sensor_qos)
         instruction_qos = QoSProfile(depth=1)
         instruction_qos.reliability = ReliabilityPolicy.RELIABLE
         instruction_qos.durability = DurabilityPolicy.TRANSIENT_LOCAL
         self.instruction_sub = self.create_subscription(String, args.instruction_topic, self.instruction_callback, instruction_qos)
-        self.camera_info_sub = self.create_subscription(CameraInfo, args.camera_info_topic, self.camera_info_callback, 10)
+        self.camera_info_sub = self.create_subscription(CameraInfo, args.camera_info_topic, self.camera_info_callback, sensor_qos)
         goal_qos = QoSProfile(depth=1)
         goal_qos.reliability = ReliabilityPolicy.RELIABLE
         goal_qos.durability = DurabilityPolicy.TRANSIENT_LOCAL
@@ -915,6 +962,24 @@ def parse_args():
     parser.add_argument('--visualization-topic', default='')
     parser.add_argument('--action-visualization-topic', default='')
     parser.add_argument('--visualization-rate-hz', type=float, default=5.0)
+    parser.add_argument(
+        '--planning-rate-hz',
+        type=float,
+        default=0.0,
+        help='Outer realworld client /eval_dual request rate. Defaults to the upstream 0.3s period.',
+    )
+    parser.add_argument(
+        '--planning-period-sec',
+        type=float,
+        default=0.3,
+        help='Outer realworld client /eval_dual request period. This is not the System-2 cadence.',
+    )
+    parser.add_argument(
+        '--inference-rate-hz',
+        type=float,
+        default=0.0,
+        help='Deprecated alias for --planning-rate-hz.',
+    )
     parser.add_argument('--enable-visualization', action='store_true')
     parser.add_argument('--disable-visualization', dest='enable_visualization', action='store_false')
     parser.set_defaults(enable_visualization=False)
@@ -929,6 +994,12 @@ if __name__ == '__main__':
     http_url = args.url
     force_look_down = bool(args.look_down)
     trace_path = args.trace_path
+    if float(args.planning_rate_hz or 0.0) > 0.0:
+        planning_period_sec = 1.0 / max(float(args.planning_rate_hz), 0.01)
+    elif float(args.inference_rate_hz or 0.0) > 0.0:
+        planning_period_sec = 1.0 / max(float(args.inference_rate_hz), 0.01)
+    else:
+        planning_period_sec = max(float(args.planning_period_sec), 0.01)
     control_thread_instance = threading.Thread(target=control_thread)
     planning_thread_instance = threading.Thread(target=planning_thread)
     control_thread_instance.daemon = True
