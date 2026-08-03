@@ -1,5 +1,6 @@
 import copy
 import argparse
+import hashlib
 import io
 import json
 import math
@@ -74,6 +75,7 @@ def dual_sys_eval(
     intrinsic=None,
     look_down=False,
     timeout=100,
+    planning_trace_context=None,
 ):
     global policy_init, http_idx, first_running_time
     data = {
@@ -95,6 +97,14 @@ def dual_sys_eval(
         'depth': ('depth_image', depth_bytes, 'image/png'),
     }
     start = time.time()
+    instruction_utf8 = data['instruction'].encode('utf-8')
+    trace_fields = dict(planning_trace_context or {})
+    trace_fields.update(
+        request_id=data['request_id'],
+        instruction_utf8_sha256=hashlib.sha256(instruction_utf8).hexdigest(),
+        instruction_utf8_bytes=len(instruction_utf8),
+    )
+    _write_trace('planning_request_started', **trace_fields)
     response = requests.post(url, files=files, data={'json': json_data}, timeout=timeout)
     response.raise_for_status()
     print(f"response {response.text}")
@@ -244,7 +254,7 @@ def _write_trace(event, **fields):
         print(f"failed to write InternNav client trace: {exc!r}")
 
 
-def _publish_status(status, **debug):
+def _publish_status(status, *, emit_trace=True, **debug):
     if manager is None:
         return
     payload = {
@@ -259,7 +269,8 @@ def _publish_status(status, **debug):
         'debug': debug,
     }
     manager.publish_status(payload)
-    _write_trace(status, **debug)
+    if emit_trace:
+        _write_trace(status, **debug)
 
 
 def _short_json(value, limit=96):
@@ -443,6 +454,7 @@ def planning_thread():
                 next_request_id = http_idx + 1
                 _publish_status(
                     'planning_request_started',
+                    emit_trace=False,
                     request_id=next_request_id,
                     planning_period_sec=desired_time,
                     odom=odom_infer,
@@ -458,6 +470,11 @@ def planning_thread():
                     camera_pose=camera_pose,
                     intrinsic=latest_intrinsic,
                     look_down=force_look_down,
+                    planning_trace_context={
+                        'planning_period_sec': desired_time,
+                        'odom': odom_infer,
+                        'rgb_time': rgb_time,
+                    },
                 )
                 response_kind = _classify_dual_system_response(response)
                 debug = response.get('debug', {}) if isinstance(response, dict) else {}
