@@ -37,10 +37,113 @@ class ControlMode(Enum):
     MPC_Mode = 2
 
 
+# --------------------------------------------------------------------------- #
+# Robot output velocity limits
+# --------------------------------------------------------------------------- #
+# These are the only places this client bounds the velocity it publishes on
+# cmd_vel.  They are settings of this client, so they are configured the same way
+# every other setting of this client is -- as arguments of the parser in
+# parse_args() below, whose `default=` is the stored value and whose flag is the
+# per-invocation override.  Deliberately not read from the environment: they are
+# parameters of this program, not of the machine it runs on.
+#
+# TO MAKE THE ROBOT GO FASTER, RAISE BOTH --mpc-max-linear-velocity AND
+# --mpc-reference-velocity.  Measured on the real solver, the commanded speed is
+# min(reference, max_linear) only while the robot sits exactly on its reference,
+# so raising the ceiling alone changes nothing at the 0.3 default.  But in
+# production the robot is essentially always catching up: the client drops the
+# first 3 points of every returned trajectory (see the `i < 3` skip in
+# planning_thread), giving a median reference gap of 0.090 m, and a gap of only
+# 0.05 m is already enough for the solver to command the ceiling instead.  That
+# is why 95.6 % of 43,931 banked MPC control ticks published exactly 0.4000.
+# Raising the reference speed alone would likewise be given back as soon as the
+# robot converged onto its path, so raise the two together.
+#
+# Expect only a modest change in distance covered: the robot is *asked* to move
+# forward in just 1.3-16.6 % of control ticks, because most model responses turn
+# or stop rather than translate.  A higher limit raises the speed inside that
+# window; it does not widen it.  The drive was also measured chattering at ~12x
+# its commanded joint velocity, so raise in small steps and watch achieved
+# against commanded, not just the setting.
+MPC_REFERENCE_VELOCITY = 0.3
+MPC_MAX_LINEAR_VELOCITY = 0.4
+#
+# BOTH angular ceilings bind, so both are raised together.  Measured over the
+# 12,270 in-window control ticks of the four banked runs in
+# outputs/lane_spd_v06_v1 (which ran the linear pair at 0.6 and left angular at
+# the old 0.4/0.5), 80.7 % of all commanded rotation was issued while pinned
+# exactly on one of these two ceilings -- 59.8 % on the PID clamp and 20.9 % on
+# the MPC bound.  Neither is the sole governor: the PID path produced 66.1 % of
+# all commanded rotation overall and 94.6 % of it in the turn-heavy case, while
+# the MPC bound dominated the case that mostly drove forward.  Raising only one
+# would leave the other binding, so they move together.
+#
+# 1.0 rad/s is chosen against the two limiters downstream of this client, not
+# picked for roundness.  Isaac's diff-drive graph clamps angular at
+# max_angular_speed=1.5 (SpawnUsdRobot.py), and the same graph clips the wheel
+# command at maxWheelSpeed=10.0 rad/s, where wheel = (v + 0.208*w)/0.085.  At
+# our linear setting of 0.6 that clip engages at w = 1.2019, so 1.2 sits at
+# 100.0 % of the wheel budget with no margin, whereas 1.0 sits at 95.1 % and at
+# 66.7 % of the angular clamp -- both limiters stay out of the loop even when
+# full linear and full angular are commanded at once.  The exogenous sweep in
+# tmp/lane_b3_velocity_scale also measured achieved-over-commanded yaw rate
+# holding at 0.25-0.37 from 0.1 through 1.2 rad/s, so the raise does convert
+# into rotation, but in the production cadence that ratio falls from 0.344 at
+# 0.8 to 0.248 at 1.2 -- another reason to stop short of 1.2.
+MPC_MAX_ANGULAR_VELOCITY = 1.0
+# Inert today: the discrete-action path only translates on action token 1, which
+# was absent from all 9,660 recorded discrete actions across 27 traces, and one
+# such token would command Kp_trans(2.0) * 0.25 m = 0.5 m/s anyway, already under
+# this clamp.  Kept settable so it binds if the model ever emits that token.
+PID_MAX_LINEAR_VELOCITY = 0.6
+# See MPC_MAX_ANGULAR_VELOCITY above: this is the clamp that governs the larger
+# share of commanded rotation, because the discrete +-15 deg turn tokens are
+# served by this path.
+PID_MAX_ANGULAR_VELOCITY = 1.0
+
+#: Names of the velocity settings, in the order they are reported.  The argparse
+#: dest and the module global share each name, so this is the whole wiring table.
+VELOCITY_SETTINGS = (
+    'mpc_reference_velocity',
+    'mpc_max_linear_velocity',
+    'mpc_max_angular_velocity',
+    'pid_max_linear_velocity',
+    'pid_max_angular_velocity',
+)
+
+
+def apply_velocity_config(args):
+    """Copy the parsed velocity settings onto the objects that enforce them.
+
+    Called once before the control and planning threads start, so no tick can
+    run against a half-applied configuration.  The MPC values are read at every
+    ``Mpc_controller`` construction; the PID values are written onto the live
+    controller, whose ``pd_step`` re-reads them on each call.
+    """
+    global mpc_reference_velocity, mpc_max_linear_velocity, mpc_max_angular_velocity
+    global pid_max_linear_velocity, pid_max_angular_velocity
+    resolved = {name: float(getattr(args, name)) for name in VELOCITY_SETTINGS}
+    mpc_reference_velocity = resolved['mpc_reference_velocity']
+    mpc_max_linear_velocity = resolved['mpc_max_linear_velocity']
+    mpc_max_angular_velocity = resolved['mpc_max_angular_velocity']
+    pid_max_linear_velocity = resolved['pid_max_linear_velocity']
+    pid_max_angular_velocity = resolved['pid_max_angular_velocity']
+    pid.max_v = pid_max_linear_velocity
+    pid.max_w = pid_max_angular_velocity
+    return resolved
+
+
 # global variable
 policy_init = True
 mpc = None
-pid = PID_controller(Kp_trans=2.0, Kd_trans=0.0, Kp_yaw=1.5, Kd_yaw=0.0, max_v=0.6, max_w=0.5)
+pid = PID_controller(
+    Kp_trans=2.0,
+    Kd_trans=0.0,
+    Kp_yaw=1.5,
+    Kd_yaw=0.0,
+    max_v=PID_MAX_LINEAR_VELOCITY,
+    max_w=PID_MAX_ANGULAR_VELOCITY,
+)
 http_idx = -1
 first_running_time = 0.0
 last_pixel_goal = None
@@ -56,6 +159,16 @@ force_look_down = False
 last_readiness_log_time = 0.0
 trace_path = ''
 last_overlay_publish_time = 0.0
+
+# In force after apply_velocity_config(); the parser's defaults until then.  Note
+# `mpc_reference_velocity` is the MPC reference-point spacing parameter, whereas
+# `desired_v` just below is the commanded velocity for the current tick -- they
+# are unrelated despite the similar upstream naming.
+mpc_reference_velocity = MPC_REFERENCE_VELOCITY
+mpc_max_linear_velocity = MPC_MAX_LINEAR_VELOCITY
+mpc_max_angular_velocity = MPC_MAX_ANGULAR_VELOCITY
+pid_max_linear_velocity = PID_MAX_LINEAR_VELOCITY
+pid_max_angular_velocity = PID_MAX_ANGULAR_VELOCITY
 
 desired_v, desired_w = 0.0, 0.0
 rgb_depth_rw_lock = ReadWriteLock()
@@ -537,7 +650,12 @@ def planning_thread():
                 mpc_rw_lock.acquire_write()
                 global mpc
                 if mpc is None:
-                    mpc = Mpc_controller(np.array(trajs_in_world))
+                    mpc = Mpc_controller(
+                        np.array(trajs_in_world),
+                        desired_v=mpc_reference_velocity,
+                        v_max=mpc_max_linear_velocity,
+                        w_max=mpc_max_angular_velocity,
+                    )
                 else:
                     mpc.update_ref_traj(np.array(trajs_in_world))
                 manager.request_cnt += 1
@@ -1002,6 +1120,72 @@ def parse_args():
     parser.set_defaults(enable_visualization=False)
     parser.add_argument('--trace-path', default='')
     parser.add_argument('--look-down', action='store_true')
+    # --- Robot output velocity limits ------------------------------------- #
+    # See the block at the top of this file for which of these actually binds.
+    parser.add_argument(
+        '--mpc-max-linear-velocity',
+        type=float,
+        default=MPC_MAX_LINEAR_VELOCITY,
+        help=(
+            'Ceiling on the linear velocity the MPC may command, in m/s '
+            f'(default {MPC_MAX_LINEAR_VELOCITY}). This is the limit that '
+            'actually binds: 95.6%% of 43,931 banked MPC control ticks published '
+            'exactly 0.4000, because the robot is nearly always catching up to a '
+            'reference that starts ahead of it. Raise --mpc-reference-velocity '
+            'alongside it, or the gain is given back once the robot converges '
+            'onto its path.'
+        ),
+    )
+    parser.add_argument(
+        '--mpc-reference-velocity',
+        type=float,
+        default=MPC_REFERENCE_VELOCITY,
+        help=(
+            'MPC reference-point spacing, upstream desired_v, in m/s '
+            f'(default {MPC_REFERENCE_VELOCITY}). Not a velocity command: it '
+            'reaches the solver only as desired_v * ref_gap * T, the arc length '
+            'between reference points. It sets the speed once the robot is ON '
+            'its reference; while catching up, --mpc-max-linear-velocity is what '
+            'limits the command.'
+        ),
+    )
+    parser.add_argument(
+        '--mpc-max-angular-velocity',
+        type=float,
+        default=MPC_MAX_ANGULAR_VELOCITY,
+        help=(
+            'Bound on the angular velocity the MPC may command, in rad/s '
+            f'(default {MPC_MAX_ANGULAR_VELOCITY}). Binding: 20.9 %% of all '
+            'commanded rotation in the four banked runs was issued exactly on '
+            'this bound. Do not exceed 1.2 while --mpc-max-linear-velocity is '
+            '0.6 -- Isaac clips the wheel command at that point.'
+        ),
+    )
+    parser.add_argument(
+        '--pid-max-angular-velocity',
+        type=float,
+        default=PID_MAX_ANGULAR_VELOCITY,
+        help=(
+            'Clamp on the angular velocity the discrete-action/PID path may '
+            f'command, in rad/s (default {PID_MAX_ANGULAR_VELOCITY}). This is '
+            'the ceiling that governs the largest share of turning: 59.8 %% of '
+            'all commanded rotation in the four banked runs was issued exactly '
+            'on it, because the discrete +-15 deg turn tokens are served here. '
+            'Same 1.2 wheel-clip caveat as --mpc-max-angular-velocity.'
+        ),
+    )
+    parser.add_argument(
+        '--pid-max-linear-velocity',
+        type=float,
+        default=PID_MAX_LINEAR_VELOCITY,
+        help=(
+            'Clamp on the linear velocity the discrete-action/PID path may '
+            f'command, in m/s (default {PID_MAX_LINEAR_VELOCITY}). Currently '
+            'inert -- that path never translates today; see the note beside '
+            'PID_MAX_LINEAR_VELOCITY. Use --mpc-max-linear-velocity to change '
+            'how fast the robot moves.'
+        ),
+    )
     args, ros_args = parser.parse_known_args()
     return args, ros_args
 
@@ -1017,6 +1201,13 @@ if __name__ == '__main__':
         planning_period_sec = 1.0 / max(float(args.inference_rate_hz), 0.01)
     else:
         planning_period_sec = max(float(args.planning_period_sec), 0.01)
+    # Apply before the threads start, so no tick can run against a half-applied
+    # configuration. trace_path is already set above, so the velocity_config
+    # record is the first thing in the trace and a reader never has to infer
+    # whether a setting was picked up.
+    velocity_config = apply_velocity_config(args)
+    print(f'official InternNav client velocity limits: {velocity_config}')
+    _write_trace('velocity_config', **velocity_config)
     control_thread_instance = threading.Thread(target=control_thread)
     planning_thread_instance = threading.Thread(target=planning_thread)
     control_thread_instance.daemon = True
