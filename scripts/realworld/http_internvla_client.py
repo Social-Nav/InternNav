@@ -16,7 +16,7 @@ import requests
 from geometry_msgs.msg import PoseStamped, Twist
 from nav_msgs.msg import Odometry
 from PIL import Image as PIL_Image
-from PIL import ImageDraw
+from PIL import ImageDraw, ImageFont
 from sensor_msgs.msg import CameraInfo, Image
 from std_msgs.msg import Int16, String
 
@@ -159,6 +159,12 @@ force_look_down = False
 last_readiness_log_time = 0.0
 trace_path = ''
 last_overlay_publish_time = 0.0
+OVERLAY_FONT_CANDIDATES = (
+    '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf',
+    '/usr/share/fonts/dejavu/DejaVuSans.ttf',
+    '/usr/local/share/fonts/DejaVuSans.ttf',
+)
+_overlay_font_cache = {}
 
 # In force after apply_velocity_config(); the parser's defaults until then.  Note
 # `mpc_reference_velocity` is the MPC reference-point spacing parameter, whereas
@@ -406,6 +412,133 @@ def _action_label(actions):
         return str(actions)
 
 
+def _semantic_llm_output(raw_output):
+    """Return a readable label without changing the decoded model response.
+
+    A response containing exactly one arrow direction is labelled with that
+    direction and retains its whitespace-normalized raw text in parentheses.
+    Two integer tokens are displayed as a pixel target. Mixed arrow directions
+    and every other non-empty response are explicitly marked ``UNKNOWN``.
+    """
+    text = ' '.join(str(raw_output or '').split())
+    if not text:
+        return 'UNKNOWN (empty)'
+    if text.upper() == 'STOP':
+        return 'STOP'
+
+    numeric_tokens = text.split()
+    if len(numeric_tokens) == 2 and all(token.lstrip('+-').isdigit() for token in numeric_tokens):
+        return f'PIXEL_TARGET={text}'
+
+    arrow_labels = {
+        '←': 'TURN_LEFT',
+        '→': 'TURN_RIGHT',
+        '↑': 'GO_STRAIGHT',
+        '↓': 'GO_BACK',
+    }
+    arrows = [character for character in text if character in arrow_labels]
+    if arrows and len(set(arrows)) == 1:
+        return f'{arrow_labels[arrows[0]]} ({text})'
+    return f'UNKNOWN ({text})'
+
+
+def _font_supports_overlay_glyphs(font):
+    """Check that all four arrows have non-empty, distinct rendered glyphs."""
+    glyph_rasters = []
+    for glyph in '←↑→↓':
+        mask = font.getmask(glyph)
+        if mask.getbbox() is None:
+            return False
+        glyph_rasters.append((mask.size, bytes(mask)))
+    return len(set(glyph_rasters)) == 4
+
+
+def _load_overlay_font(size=12, candidates=None):
+    """Load a concrete TrueType font with real arrow glyphs or fail loudly."""
+    attempted = []
+    for path in candidates or OVERLAY_FONT_CANDIDATES:
+        attempted.append(path)
+        if not os.path.isfile(path):
+            continue
+        try:
+            font = ImageFont.truetype(path, size)
+        except Exception:
+            continue
+        if _font_supports_overlay_glyphs(font):
+            return font
+    raise RuntimeError(f'no usable InternNav overlay TTF with arrow glyphs; tried={attempted}')
+
+
+def _get_overlay_font(size=12):
+    font = _overlay_font_cache.get(size)
+    if font is None:
+        font = _load_overlay_font(size=size)
+        _overlay_font_cache[size] = font
+    return font
+
+
+def _text_width(draw, text, font):
+    left, _top, right, _bottom = draw.textbbox((0, 0), text, font=font)
+    return right - left
+
+
+def _fit_prefix_by_pixel_width(draw, text, font, max_width):
+    low, high, best = 1, len(text), 0
+    while low <= high:
+        middle = (low + high) // 2
+        if _text_width(draw, text[:middle], font) <= max_width:
+            best = middle
+            low = middle + 1
+        else:
+            high = middle - 1
+    return best
+
+
+def _fit_text_with_ellipsis(draw, text, font, max_width):
+    ellipsis = '…'
+    normalized = ' '.join(str(text or '').split())
+    if _text_width(draw, normalized + ellipsis, font) <= max_width:
+        return normalized + ellipsis
+    prefix_length = _fit_prefix_by_pixel_width(draw, normalized, font, max_width - _text_width(draw, ellipsis, font))
+    return normalized[:prefix_length].rstrip() + ellipsis
+
+
+def _wrap_text_by_pixel_width(draw, text, font, max_width, max_lines=3):
+    """Whitespace-normalize and wrap text using measured glyph widths."""
+    if max_width <= 0 or max_lines <= 0:
+        raise ValueError('max_width and max_lines must be positive')
+    words = ' '.join(str(text or '').split()).split()
+    if not words:
+        return []
+
+    lines = []
+    current = ''
+    for word in words:
+        candidate = f'{current} {word}'.strip()
+        if _text_width(draw, candidate, font) <= max_width:
+            current = candidate
+            continue
+        if current:
+            lines.append(current)
+            current = ''
+        remainder = word
+        while remainder and _text_width(draw, remainder, font) > max_width:
+            prefix_length = _fit_prefix_by_pixel_width(draw, remainder, font, max_width)
+            if prefix_length <= 0:
+                raise ValueError('max_width is narrower than one rendered glyph')
+            lines.append(remainder[:prefix_length])
+            remainder = remainder[prefix_length:]
+        current = remainder
+    if current:
+        lines.append(current)
+
+    if len(lines) > max_lines:
+        visible = lines[:max_lines]
+        visible[-1] = _fit_text_with_ellipsis(draw, visible[-1], font, max_width)
+        return visible
+    return lines
+
+
 def _extract_xy_pairs(values):
     points = []
     if not isinstance(values, (list, tuple)):
@@ -446,16 +579,22 @@ def _publish_debug_overlay(response, *, odom_infer=None, rgb_image=None, traject
     if rgb_image is None:
         return
 
+    # Resolve the font before the broad rendering guard: a missing or glyph-less
+    # font is a configuration error and must not degrade into PIL's silent tofu.
+    font = _get_overlay_font(size=12)
+
     try:
         base = np.asarray(rgb_image, dtype=np.uint8)
         image = PIL_Image.fromarray(base).convert('RGB')
         draw = ImageDraw.Draw(image, 'RGBA')
         width, height = image.size
-        panel_h = 132
-        draw.rectangle((0, 0, width, panel_h), fill=(0, 0, 0, 184), outline=(0, 220, 255, 255), width=2)
 
         debug = response.get('debug') if isinstance(response, dict) else {}
-        trajectory_points = _extract_xy_pairs(trajectory or response.get('output_trajectory') or response.get('trajectory')) if isinstance(response, dict) else []
+        trajectory_points = (
+            _extract_xy_pairs(trajectory or response.get('output_trajectory') or response.get('trajectory'))
+            if isinstance(response, dict)
+            else []
+        )
         discrete_action = response.get('discrete_action') if isinstance(response, dict) else None
         pixel_goal = response.get('output_pixel', response.get('pixel_goal')) if isinstance(response, dict) else None
 
@@ -467,7 +606,7 @@ def _publish_debug_overlay(response, *, odom_infer=None, rgb_image=None, traject
             f"HTTP idx={http_idx} request_cnt={getattr(manager, 'request_cnt', 0)} server={float((debug or {}).get('server_compute_sec') or 0.0):.2f}s",
         ]
         if debug and debug.get('llm_output'):
-            lines.append('LLM: ' + str(debug.get('llm_output'))[:110])
+            lines.append('LLM: ' + _semantic_llm_output(debug.get('llm_output')))
         if debug:
             lines.append(
                 'pending: '
@@ -475,18 +614,34 @@ def _publish_debug_overlay(response, *, odom_infer=None, rgb_image=None, traject
                 f"S1_action={bool(debug.get('system1_output_action_pending'))} "
                 f"S2_ep={debug.get('system2_episode_idx')}"
             )
-        for idx, line in enumerate(lines[:7]):
-            draw.text((12, 10 + idx * 18), line, fill=(255, 255, 255, 255))
 
-        # Draw the latest System-1 local trajectory in a small robot-frame inset.
-        inset = (width - 170, panel_h + 10, width - 10, panel_h + 170)
+        line_step = 16
+        instruction_lines = _wrap_text_by_pixel_width(
+            draw,
+            f'Instruction: {latest_instruction}',
+            font,
+            max_width=width - 24,
+            max_lines=3,
+        )
+        body_y = 10 + len(instruction_lines) * line_step + 6
+        visible_lines = lines[:7]
+        panel_h = body_y + len(visible_lines) * line_step + 8
+        draw.rectangle((0, 0, width, panel_h), fill=(0, 0, 0, 184), outline=(0, 220, 255, 255), width=2)
+        for idx, line in enumerate(instruction_lines):
+            draw.text((12, 10 + idx * line_step), line, fill=(180, 255, 180, 255), font=font)
+        for idx, line in enumerate(visible_lines):
+            draw.text((12, body_y + idx * line_step), line, fill=(255, 255, 255, 255), font=font)
+
+        # Draw the latest System-1 local trajectory below the instruction panel.
+        inset_size = min(160, max(60, height - panel_h - 20))
+        inset = (width - inset_size - 10, panel_h + 10, width - 10, min(height - 10, panel_h + 10 + inset_size))
         draw.rectangle(inset, fill=(0, 0, 0, 148), outline=(255, 200, 0, 255), width=2)
         cx = (inset[0] + inset[2]) // 2
         cy = inset[3] - 18
         draw.line((cx, inset[1] + 10, cx, inset[3] - 8), fill=(80, 80, 80, 255), width=1)
         draw.line((inset[0] + 10, cy, inset[2] - 10, cy), fill=(80, 80, 80, 255), width=1)
         draw.polygon([(cx, cy - 10), (cx - 7, cy + 7), (cx + 7, cy + 7)], fill=(255, 80, 80, 255))
-        draw.text((inset[0] + 8, inset[1] + 6), 'S1 traj', fill=(255, 220, 0, 255))
+        draw.text((inset[0] + 8, inset[1] + 6), 'S1 traj', fill=(255, 220, 0, 255), font=font)
         _draw_polyline(draw, trajectory_points, (cx, cy), 28.0, (0, 220, 255, 255), width=3)
 
         if pixel_goal and isinstance(pixel_goal, (list, tuple)) and len(pixel_goal) >= 2:
