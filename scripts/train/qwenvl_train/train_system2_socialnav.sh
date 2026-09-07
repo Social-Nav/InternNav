@@ -7,11 +7,7 @@
 #      NOT "internvla-n1-system2" (see trainer:149 string dispatch):
 #        huggingface-cli download InternRobotics/InternVLA-N1-System2 \
 #          --local-dir checkpoints/qwen2.5-vl-n1s2-base
-#   2. traj_data/socialnav/<scene>/{meta,data,videos} with labels for 132cm_30deg:
-#        python scripts/data/gen_pixel_goal_labels.py \
-#          --data-path traj_data/socialnav --height 132 --pitch-1 30 --pitch-2 30 \
-#          --hfov 90 --dry-run        # drop --dry-run once goal hit-rate looks sane
-#   3. socialnav_132cm_30_30 registered in internvla_n1_lerobot_dataset.py data_dict
+#   2. socialnav_132cm_30_30 registered in internvla_n1_lerobot_dataset.py data_dict
 #
 # Must be run from the repo root; the trainer does a bare `import qwenvl_base`.
 
@@ -24,9 +20,7 @@ export OMP_NUM_THREADS=8
 deepspeed=scripts/train/qwenvl_train/zero2.json
 llm=checkpoints/qwen2.5-vl-n1s2-base
 
-# 8 GPUs x bs2 x ga2 = effective batch 32.
-# Official is 128 (64 GPUs x 2 x 1); 32 is deliberate here -- a small dataset
-# needs more optimizer steps per epoch, and lr is scaled down to match.
+# 8 GPUs x bs2 x ga2 =  32
 batch_size=2
 grad_accum_steps=2
 lr=1e-5
