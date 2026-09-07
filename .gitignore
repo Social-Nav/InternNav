@@ -152,3 +152,12 @@ checkpoints
 internnav/model/basemodel/LongCLIP/
 .gradio/
 result/
+
+# local datasets (multi-GB, never commit)
+social_gen/
+VLNCE_Dataset/
+traj_data/
+*.parquet
+
+# papers / reference PDFs kept locally
+docs/*.pdf

@@ -124,7 +124,15 @@ SCALEVLN_60CM_30_30 = {
     "pitch_2": 30,
 }
 
+SOCIALNAV_132CM_30_30 = {
+    "data_path": "traj_data/socialnav",
+    "height": 132,
+    "pitch_1": 30,
+    "pitch_2": 30,
+}
+
 data_dict = {
+    "socialnav_132cm_30_30": SOCIALNAV_132CM_30_30,
     "cambrian_737k": CAMBRIAN_737K,
     "cambrian_737k_pack": CAMBRIAN_737K_PACK,
     "mp_doc": MP_DOC,
