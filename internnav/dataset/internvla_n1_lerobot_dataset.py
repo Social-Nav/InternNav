@@ -577,19 +577,20 @@ class LazySupervisedDataset(Dataset):
 
 
 def interpolate_and_resample_trajectory(absolute_trajectories, predict_step_num=None):
+    """Build System1 trajectory labels from real poses (SocialGen).
+
+    SocialGen notes (Feishu): drop zero-motion mask (steps_sq > 0.05) and
+    drop arc-length / interval=0.1 spline resampling. At ~30 FPS, subsample
+    real xy into predict_step_num+1 points (no interpolation).
+    """
     start_point = np.array([[0.0, 0.0]])  # Avoid creating arrays repeatedly
 
     traj = absolute_trajectories[..., :2]
-    # Vectorized filtering of valid steps (distance squared > 0.05)
-    steps = traj[1:] - traj[:-1]  # (T, 2)
-    steps_sq = (steps**2).sum(axis=-1)  # (T,)
-    mask = steps_sq > 0.05  # (T,)
+    # No steps_sq mask: on SocialGen nearly all frames fail >0.05 and get dropped.
+    # Keep full trajectory; prepend origin for relative labeling.
+    filtered_traj = np.concatenate([start_point, traj[1:]], axis=0)
 
-    # Filter and concatenate starting point
-    filtered_traj = traj[1:][mask]  # (T, 2), where M is the number of filtered steps
-    filtered_traj = np.concatenate([start_point, filtered_traj], axis=0)  # (T+1, 2)
-
-    resampled_trajectories = smooth_and_resample_trajectory(filtered_traj, sample_length=predict_step_num + 1)
+    resampled_trajectories = subsample_trajectory_uniform(filtered_traj, sample_length=predict_step_num + 1)
     resampled_relative_poses = xy_to_delta_xyt(resampled_trajectories)
 
     resampled_relative_poses[:, 0:2] *= 4  # norm
@@ -656,73 +657,32 @@ def get_trajectory_relative_to_frame(extrinsics, camera_deg=0):
     return relative_xyyaw
 
 
-from scipy.interpolate import CubicSpline
+def subsample_trajectory_uniform(points, sample_length=33):
+    """Uniformly subsample real trajectory points (no spline / interval=0.1).
 
-
-def smooth_and_resample_trajectory(points, sample_length=33, interval=0.1):
-    total_distance = sample_length * interval  # Total sampling length
-
+    Replaces smooth_and_resample_trajectory for SocialGen: supervision is
+    predict_step_num waypoints taken from logged poses, not a fixed 3.3 m
+    arc-length resample.
+    """
     if len(points) == 0:
         return np.zeros((sample_length, 2))
 
     if len(points) == 1:
         return np.tile(points[0], (sample_length, 1))
 
-    # Calculate cumulative distance of the original trajectory
-    diff = np.diff(points, axis=0)
-    segment_lengths = np.sqrt(np.sum(diff**2, axis=1))
-    cumulative_distances = np.cumsum(segment_lengths)
-    cumulative_distances = np.insert(cumulative_distances, 0, 0)  # Starting point distance is 0
+    if len(points) == sample_length:
+        return points.copy()
 
-    # Use cubic spline interpolation for smoothing
-    if len(points) > 3:  # At least 4 points are needed for cubic spline interpolation
-        # Construct cubic splines using cumulative distance as the parameter
-        cs_x = CubicSpline(cumulative_distances, points[:, 0])
-        cs_y = CubicSpline(cumulative_distances, points[:, 1])
+    if len(points) > sample_length:
+        idx = np.linspace(0, len(points) - 1, sample_length)
+        idx = np.round(idx).astype(np.int64)
+        idx[0] = 0
+        idx[-1] = len(points) - 1
+        return points[idx]
 
-        # Perform dense sampling within the original cumulative distance range
-        dense_distances = np.linspace(0, cumulative_distances[-1], max(50, len(points) * 2))
-        x_smooth = cs_x(dense_distances)
-        y_smooth = cs_y(dense_distances)
-        smoothed_points = np.column_stack((x_smooth, y_smooth))
-
-        # Recalculate cumulative distance of the smoothed trajectory
-        smooth_diff = np.diff(smoothed_points, axis=0)
-        smooth_segment_lengths = np.sqrt(np.sum(smooth_diff**2, axis=1))
-        smooth_cumulative_distances = np.cumsum(smooth_segment_lengths)
-        smooth_cumulative_distances = np.insert(smooth_cumulative_distances, 0, 0)
-    else:
-        # Too few points for cubic spline interpolation, use original points directly
-        smoothed_points = points
-        smooth_cumulative_distances = cumulative_distances
-
-    # Target sampling point distances
-    target_distances = np.linspace(0, total_distance, sample_length)
-
-    # Initialize result array
-    resampled = np.zeros((sample_length, 2))
-
-    # Interpolate for each target distance
-    for i, target_dist in enumerate(target_distances):
-        # If target distance exceeds total trajectory length, use the last point
-        if target_dist >= smooth_cumulative_distances[-1]:
-            resampled[i] = smoothed_points[-1]
-            continue
-
-        # Find the line segment where the target distance is located
-        segment_idx = np.searchsorted(smooth_cumulative_distances, target_dist, side='right') - 1
-
-        # Calculate interpolation ratio
-        start_dist = smooth_cumulative_distances[segment_idx]
-        end_dist = smooth_cumulative_distances[segment_idx + 1]
-        t = (target_dist - start_dist) / (end_dist - start_dist)
-
-        # Linear interpolation
-        resampled[i] = smoothed_points[segment_idx] + t * (
-            smoothed_points[segment_idx + 1] - smoothed_points[segment_idx]
-        )
-
-    return resampled
+    # Fewer points than needed: pad with last pose (same contract as clip_or_pad)
+    pad = np.repeat(points[-1][None, :], sample_length - len(points), axis=0)
+    return np.concatenate([points, pad], axis=0)
 
 
 def xy_to_delta_xyt(xy_actions):
