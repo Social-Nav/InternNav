@@ -579,9 +579,11 @@ class LazySupervisedDataset(Dataset):
 def interpolate_and_resample_trajectory(absolute_trajectories, predict_step_num=None):
     """Build System1 trajectory labels from real poses (SocialGen).
 
-    SocialGen notes (Feishu): drop zero-motion mask (steps_sq > 0.05) and
-    drop arc-length / interval=0.1 spline resampling. At ~30 FPS, subsample
-    real xy into predict_step_num+1 points (no interpolation).
+    SocialGen / Stage-2 rules:
+    - No zero-motion mask (steps_sq > 0.05 would wipe ~30 FPS frames).
+    - No cubic-spline / interval=0.1 interpolation (use logged poses only).
+    - Cap supervised path at ~3.3 m (predict_step_num * 0.1), then pick
+      predict_step_num+1 real frames by equal arc-length on that prefix.
     """
     start_point = np.array([[0.0, 0.0]])  # Avoid creating arrays repeatedly
 
@@ -590,7 +592,11 @@ def interpolate_and_resample_trajectory(absolute_trajectories, predict_step_num=
     # Keep full trajectory; prepend origin for relative labeling.
     filtered_traj = np.concatenate([start_point, traj[1:]], axis=0)
 
-    resampled_trajectories = subsample_trajectory_uniform(filtered_traj, sample_length=predict_step_num + 1)
+    resampled_trajectories = subsample_trajectory_arclength_capped(
+        filtered_traj,
+        sample_length=predict_step_num + 1,
+        max_distance=3.3,
+    )
     resampled_relative_poses = xy_to_delta_xyt(resampled_trajectories)
 
     resampled_relative_poses[:, 0:2] *= 4  # norm
@@ -657,32 +663,44 @@ def get_trajectory_relative_to_frame(extrinsics, camera_deg=0):
     return relative_xyyaw
 
 
-def subsample_trajectory_uniform(points, sample_length=33):
-    """Uniformly subsample real trajectory points (no spline / interval=0.1).
-
-    Replaces smooth_and_resample_trajectory for SocialGen: supervision is
-    predict_step_num waypoints taken from logged poses, not a fixed 3.3 m
-    arc-length resample.
-    """
+def subsample_trajectory_arclength_capped(points, sample_length=33, max_distance=3.3):
+    """Take real poses only: first max_distance meters, then equal arc-length indices."""
+    points = np.asarray(points, dtype=np.float64)
     if len(points) == 0:
         return np.zeros((sample_length, 2))
-
     if len(points) == 1:
         return np.tile(points[0], (sample_length, 1))
 
-    if len(points) == sample_length:
-        return points.copy()
+    diff = np.diff(points, axis=0)
+    seg = np.sqrt((diff**2).sum(axis=1))
+    cum = np.concatenate([[0.0], np.cumsum(seg)])
 
-    if len(points) > sample_length:
-        idx = np.linspace(0, len(points) - 1, sample_length)
-        idx = np.round(idx).astype(np.int64)
-        idx[0] = 0
-        idx[-1] = len(points) - 1
-        return points[idx]
+    # Prefix: only up to max_distance along the real path
+    end = int(np.searchsorted(cum, max_distance, side="right") - 1)
+    end = max(end, 0)
+    prefix = points[: end + 1]
+    cum_p = cum[: end + 1]
+    L = float(cum_p[-1])  # <= max_distance
 
-    # Fewer points than needed: pad with last pose (same contract as clip_or_pad)
-    pad = np.repeat(points[-1][None, :], sample_length - len(points), axis=0)
-    return np.concatenate([points, pad], axis=0)
+    if len(prefix) == 1:
+        return np.tile(prefix[0], (sample_length, 1))
+
+    targets = np.linspace(0.0, L, sample_length)
+    idx = np.searchsorted(cum_p, targets, side="left")
+    idx = np.clip(idx, 0, len(prefix) - 1)
+    # snap to nearer of idx-1 vs idx when not exact
+    for i, t in enumerate(targets):
+        j = idx[i]
+        if j > 0 and abs(cum_p[j - 1] - t) <= abs(cum_p[j] - t):
+            idx[i] = j - 1
+    idx[0] = 0
+    idx[-1] = len(prefix) - 1
+
+    out = prefix[idx]
+    if len(out) < sample_length:  # defensive
+        pad = np.repeat(out[-1][None, :], sample_length - len(out), axis=0)
+        out = np.concatenate([out, pad], axis=0)
+    return out
 
 
 def xy_to_delta_xyt(xy_actions):
