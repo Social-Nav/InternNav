@@ -576,22 +576,47 @@ class LazySupervisedDataset(Dataset):
         return data_dict
 
 
-def interpolate_and_resample_trajectory(absolute_trajectories, predict_step_num=None):
-    start_point = np.array([[0.0, 0.0]])  # Avoid creating arrays repeatedly
+# Arc length between consecutive System1 trajectory labels, in metres. The
+# supervised window spans predict_step_num * this (32 * 0.1 = 3.2 m).
+TRAJ_ARC_INTERVAL = 0.1
 
-    traj = absolute_trajectories[..., :2]
-    # Vectorized filtering of valid steps (distance squared > 0.05)
-    steps = traj[1:] - traj[:-1]  # (T, 2)
-    steps_sq = (steps**2).sum(axis=-1)  # (T,)
-    mask = steps_sq > 0.05  # (T,)
 
-    # Filter and concatenate starting point
-    filtered_traj = traj[1:][mask]  # (T, 2), where M is the number of filtered steps
-    filtered_traj = np.concatenate([start_point, filtered_traj], axis=0)  # (T+1, 2)
+def interpolate_and_resample_trajectory(
+    absolute_trajectories, predict_step_num=None, interval=TRAJ_ARC_INTERVAL
+):
+    """Build System1 trajectory labels by subsampling logged poses.
 
-    resampled_trajectories = smooth_and_resample_trajectory(filtered_traj, sample_length=predict_step_num + 1)
+    Two departures from upstream, both forced by ~30 FPS capture:
+      - No `steps_sq > 0.05` mask. It keeps only steps over 0.2236 m, which
+        drops every frame of a 0.016 m/frame capture; the trajectory would
+        collapse to its origin and train "stand still" at a low loss.
+      - No cubic spline. Logged poses are already finer than the label spacing.
+
+    Like upstream, spacing is measured on xy only: rotation in place does not
+    advance the ruler, so those frames are stepped over.
+
+    Output contract unchanged: (predict_step_num, 3) of [dx, dy, dyaw],
+    increments not positions, xy scaled by 4, referenced to the start frame.
+
+    Args:
+        absolute_trajectories: (n, 3) [x, y, yaw] from
+            get_trajectory_relative_to_frame.
+        predict_step_num: rows to emit; the model's output width.
+        interval: metres of arc between labels.
+
+    Returns:
+        (predict_step_num+1, 3) absolute poses and (predict_step_num, 3) increments.
+    """
+    traj = np.asarray(absolute_trajectories, dtype=np.float64)
+    if traj.ndim != 2 or traj.shape[1] < 3:
+        raise ValueError(f"expected (n, 3) [x, y, yaw], got {traj.shape}")
+
+    traj = np.concatenate([[[0.0, 0.0, 0.0]], traj[1:]], axis=0)  # relative to start
+
+    resampled_trajectories = subsample_trajectory_arclength_capped(
+        traj, sample_length=predict_step_num + 1, interval=interval
+    )
     resampled_relative_poses = xy_to_delta_xyt(resampled_trajectories)
-
     resampled_relative_poses[:, 0:2] *= 4  # norm
 
     return resampled_trajectories, resampled_relative_poses
@@ -656,96 +681,71 @@ def get_trajectory_relative_to_frame(extrinsics, camera_deg=0):
     return relative_xyyaw
 
 
-from scipy.interpolate import CubicSpline
+def subsample_trajectory_arclength_capped(points, sample_length=33, interval=TRAJ_ARC_INTERVAL):
+    """Pick `sample_length` logged poses spaced `interval` metres apart in xy.
 
+    Subsampling, not interpolation: every row returned is a real logged pose,
+    the one whose cumulative arc length sits nearest k * interval.
 
-def smooth_and_resample_trajectory(points, sample_length=33, interval=0.1):
-    total_distance = sample_length * interval  # Total sampling length
+    The ruler is absolute -- target k is at k * interval, never rescaled to the
+    path's own length -- so a step always means the same distance. A path
+    shorter than (sample_length - 1) * interval ends in repeats of its last
+    pose, as the interpolating version also clamped.
 
+    Args:
+        points: (n, 2) [x, y] or (n, 3) [x, y, yaw]. Extra columns ride along.
+        sample_length: rows to return, predict_step_num + 1.
+        interval: metres of arc between consecutive returned poses.
+
+    Returns:
+        (sample_length, points.shape[1]) of selected poses.
+    """
+    points = np.asarray(points, dtype=np.float64)
+    width = points.shape[1] if points.ndim == 2 else 2
     if len(points) == 0:
-        return np.zeros((sample_length, 2))
-
+        return np.zeros((sample_length, width))
     if len(points) == 1:
         return np.tile(points[0], (sample_length, 1))
 
-    # Calculate cumulative distance of the original trajectory
-    diff = np.diff(points, axis=0)
-    segment_lengths = np.sqrt(np.sum(diff**2, axis=1))
-    cumulative_distances = np.cumsum(segment_lengths)
-    cumulative_distances = np.insert(cumulative_distances, 0, 0)  # Starting point distance is 0
+    seg = np.sqrt((np.diff(points[:, :2], axis=0) ** 2).sum(axis=1))
+    cum = np.concatenate([[0.0], np.cumsum(seg)])
 
-    # Use cubic spline interpolation for smoothing
-    if len(points) > 3:  # At least 4 points are needed for cubic spline interpolation
-        # Construct cubic splines using cumulative distance as the parameter
-        cs_x = CubicSpline(cumulative_distances, points[:, 0])
-        cs_y = CubicSpline(cumulative_distances, points[:, 1])
+    targets = np.minimum(np.arange(sample_length, dtype=np.float64) * interval, cum[-1])
 
-        # Perform dense sampling within the original cumulative distance range
-        dense_distances = np.linspace(0, cumulative_distances[-1], max(50, len(points) * 2))
-        x_smooth = cs_x(dense_distances)
-        y_smooth = cs_y(dense_distances)
-        smoothed_points = np.column_stack((x_smooth, y_smooth))
+    idx = np.searchsorted(cum, targets, side="left")
+    idx = np.clip(idx, 0, len(points) - 1)
+    prev = np.clip(idx - 1, 0, len(points) - 1)
+    idx = np.where(np.abs(cum[prev] - targets) <= np.abs(cum[idx] - targets), prev, idx)
+    idx[0] = 0
 
-        # Recalculate cumulative distance of the smoothed trajectory
-        smooth_diff = np.diff(smoothed_points, axis=0)
-        smooth_segment_lengths = np.sqrt(np.sum(smooth_diff**2, axis=1))
-        smooth_cumulative_distances = np.cumsum(smooth_segment_lengths)
-        smooth_cumulative_distances = np.insert(smooth_cumulative_distances, 0, 0)
-    else:
-        # Too few points for cubic spline interpolation, use original points directly
-        smoothed_points = points
-        smooth_cumulative_distances = cumulative_distances
-
-    # Target sampling point distances
-    target_distances = np.linspace(0, total_distance, sample_length)
-
-    # Initialize result array
-    resampled = np.zeros((sample_length, 2))
-
-    # Interpolate for each target distance
-    for i, target_dist in enumerate(target_distances):
-        # If target distance exceeds total trajectory length, use the last point
-        if target_dist >= smooth_cumulative_distances[-1]:
-            resampled[i] = smoothed_points[-1]
-            continue
-
-        # Find the line segment where the target distance is located
-        segment_idx = np.searchsorted(smooth_cumulative_distances, target_dist, side='right') - 1
-
-        # Calculate interpolation ratio
-        start_dist = smooth_cumulative_distances[segment_idx]
-        end_dist = smooth_cumulative_distances[segment_idx + 1]
-        t = (target_dist - start_dist) / (end_dist - start_dist)
-
-        # Linear interpolation
-        resampled[i] = smoothed_points[segment_idx] + t * (
-            smoothed_points[segment_idx + 1] - smoothed_points[segment_idx]
-        )
-
-    return resampled
+    return points[idx]
 
 
-def xy_to_delta_xyt(xy_actions):
-    """
-    Compute (dx, dy, delta_yaw) where dx, dy in global frame and delta_yaw is heading difference.
+def xy_to_delta_xyt(poses):
+    """Absolute poses -> per-step increments [dx, dy, dyaw].
+
+    With a yaw column, dyaw is the logged heading change. Without one, falls back
+    to upstream behaviour: heading from arctan2(dy, dx), with row 0 holding the
+    first segment's absolute bearing rather than an increment.
 
     Args:
-        xy_actions: [N, 2] array of absolute positions
+        poses: (N, 2) [x, y] or (N, 3) [x, y, yaw] in radians.
 
     Returns:
-        delta_xyt: [N-1, 3] array
+        (N-1, 3) increments; dx, dy unscaled (caller applies the norm).
     """
-    vectors = np.diff(xy_actions, axis=0)  # [N-1, 2]
-    yaw = np.arctan2(vectors[:, 1], vectors[:, 0])  # [N-1] yaw angles w.r.t x-axis
+    poses = np.asarray(poses, dtype=np.float64)
+    vectors = np.diff(poses[:, :2], axis=0)  # [N-1, 2]
 
-    delta_yaw = np.diff(yaw)  # [N-2]
-    delta_yaw = (delta_yaw + np.pi) % (2 * np.pi) - np.pi  # wrap to [-π, π]
+    if poses.shape[1] >= 3:
+        delta_yaw = np.diff(poses[:, 2])
+        delta_yaw = (delta_yaw + np.pi) % (2 * np.pi) - np.pi  # wrap to [-pi, pi]
+    else:
+        yaw = np.arctan2(vectors[:, 1], vectors[:, 0])
+        delta_yaw = (np.diff(yaw) + np.pi) % (2 * np.pi) - np.pi
+        delta_yaw = np.concatenate([[yaw[0]], delta_yaw])
 
-    # prepend first yaw (absolute angle of first segment) as delta_yaw[0]
-    delta_yaw = np.concatenate([[yaw[0]], delta_yaw])  # now length = N-1
-
-    delta_xyt = np.concatenate([vectors, delta_yaw[:, None]], axis=1)
-    return delta_xyt
+    return np.concatenate([vectors, delta_yaw[:, None]], axis=1)
 
 
 def clip_or_pad(arr, fixed_len):
