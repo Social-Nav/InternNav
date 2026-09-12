@@ -1025,14 +1025,18 @@ class NavPixelGoalDataset(Dataset):
             image = Image.open(image_file).convert('RGB')
             lookdown_image = Image.open(image_file.replace(f'_{pitch_1}deg', f'_{pitch_2}deg')).convert('RGB')
 
-            depth_image = Image.open(
-                image_file.replace(f'_{pitch_1}deg', f'_{pitch_2}deg').replace('rgb', 'depth').replace('.jpg', '.png')
-            )
+            depth_image = None
+            if self.pixel_goal_only:
+                depth_image = Image.open(
+                    image_file.replace(f'_{pitch_1}deg', f'_{pitch_2}deg')
+                    .replace('rgb', 'depth')
+                    .replace('.jpg', '.png')
+                )
 
-            depth_image, resize_shape = self.preprocess_depth_image_v2(
-                depth_image, do_depth_scale=True, depth_scale=1000, target_height=224, target_width=224
-            )
-            depth_image = torch.as_tensor(np.ascontiguousarray(depth_image)).float()  # [H, W]
+                depth_image, resize_shape = self.preprocess_depth_image_v2(
+                    depth_image, do_depth_scale=True, depth_scale=1000, target_height=224, target_width=224
+                )
+                depth_image = torch.as_tensor(np.ascontiguousarray(depth_image)).float()  # [H, W]
             if id in history_id or id == start_frame_id:
                 if self.data_args.transform_train is not None:
                     image = self.data_args.transform_train(image)
@@ -1044,10 +1048,12 @@ class NavPixelGoalDataset(Dataset):
                     images.append(image)
                     grid_thws.append(grid_thw)
                     traj_images.append(lookdown_image)
-                    traj_depths.append(depth_image)
+                    if depth_image is not None:
+                        traj_depths.append(depth_image)
             elif id > start_frame_id:
                 traj_images.append(lookdown_image)
-                traj_depths.append(depth_image)
+                if depth_image is not None:
+                    traj_depths.append(depth_image)
 
         history_imgs = "<image>\n" * len(history_id)
 

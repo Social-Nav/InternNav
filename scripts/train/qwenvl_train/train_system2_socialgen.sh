@@ -20,11 +20,11 @@ export OMP_NUM_THREADS=8
 deepspeed=scripts/train/qwenvl_train/zero2.json
 llm=checkpoints/qwen2.5-vl-n1s2-base
 
-# 8 GPUs x bs2 x ga2 =  32
-batch_size=2
+# 8 GPUs x bs4 x ga2 =  64
+batch_size=4
 grad_accum_steps=2
-lr=1e-5
-vision_tower_lr=2e-6
+lr=2e-5
+vision_tower_lr=5e-6
 
 max_pixels=313600
 min_pixels=3136
@@ -49,8 +49,8 @@ torchrun --standalone --nnodes=1 --nproc_per_node=8 \
     --data_augmentation True \
     --resize_h 384 \
     --resize_w 384 \
-    --sample_step 4 \
-    --num_future_steps 4 \
+    --sample_step 30 \
+    --num_future_steps 10 \
     --predict_step_num 32 \
     --pixel_goal_only False \
     --system1 "none" \
@@ -63,17 +63,18 @@ torchrun --standalone --nnodes=1 --nproc_per_node=8 \
     --min_pixels ${min_pixels} \
     --eval_strategy "no" \
     --save_strategy "steps" \
-    --save_steps 500 \
+    --save_steps 300 \
     --save_total_limit 5 \
     --learning_rate ${lr} \
     --vision_tower_lr ${vision_tower_lr} \
     --weight_decay 0 \
-    --warmup_ratio 0.03 \
+    --warmup_ratio 0.003 \
     --max_grad_norm 1 \
     --lr_scheduler_type "cosine" \
-    --logging_steps 1 \
+    --logging_steps 10 \
     --model_max_length 8192 \
     --gradient_checkpointing True \
     --dataloader_num_workers 12 \
     --run_name ${run_name} \
+    --logging_dir ${output_dir}/tensorboard_logs \
     --report_to tensorboard
