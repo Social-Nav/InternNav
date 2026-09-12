@@ -17,18 +17,11 @@
 #        depth_anything_v2_metric_hypersim_vits.pth  (see internvla_n1_arch.py:37)
 #   3. socialnav_132cm_30_30 registered in internvla_n1_lerobot_dataset.py data_dict
 #
-# !! BLOCKER FOR TIME-SAMPLED DATA !!
-#   Stage2 turns on --pixel_goal_only True, which activates the trajectory
-#   supervision path. interpolate_and_resample_trajectory (dataset:578) drops
-#   every step whose squared displacement is <= 0.05, i.e. shorter than 0.2236 m.
-#   A 30 fps capture at ~0.335 m/s advances ~0.011 m per frame, so EVERY step is
-#   dropped, the filtered trajectory collapses to its single start point,
-#   smooth_and_resample_trajectory tiles that point 33 times, and traj_poses
-#   becomes all-zero. Training then converges happily to "stand still" and the
-#   loss curve looks fine. Nothing raises.
-#   Verify before trusting a run:
-#     resample the dataset to ~0.25 m row spacing (scripts/data/resample_by_arclength.py),
-#     or dump one batch and assert traj_poses.abs().sum() > 0.
+# --pixel_goal_only True turns on trajectory supervision. This fork subsamples
+# logged poses every TRAJ_ARC_INTERVAL (0.1 m) of arc instead of interpolating;
+# upstream's >0.2236 m step filter dropped every frame of a 30 FPS capture and
+# silently trained "stand still". On a new capture, dump one batch and confirm
+# traj_poses.abs().sum() > 0.
 #
 # Must be run from the repo root; the trainer does a bare `import qwenvl_base`.
 
@@ -38,11 +31,7 @@ export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 export TOKENIZERS_PARALLELISM=false
 export OMP_NUM_THREADS=8
 
-# DeepSpeed configuration
 deepspeed=scripts/train/qwenvl_train/zero2.json
-
-# Model configuration
-llm=Qwen/Qwen2.5-VL-7B-Instruct
 
 # 8 GPUs x bs2 x ga2 = 32.
 batch_size=2
@@ -96,13 +85,14 @@ torchrun --standalone --nnodes=1 --nproc_per_node=8 \
     --save_total_limit 5 \
     --learning_rate ${lr} \
     --weight_decay 0 \
-    --warmup_ratio 0.03 \
+    --warmup_ratio 0.003 \
     --max_grad_norm 1 \
     --lr_scheduler_type "cosine_with_min_lr" \
     --lr_scheduler_kwargs '{"min_lr": 1e-05}' \
-    --logging_steps 1 \
+    --logging_steps 10 \
     --model_max_length 8192 \
     --gradient_checkpointing True \
     --dataloader_num_workers 12 \
     --run_name ${run_name} \
+    --logging_dir ${output_dir}/tensorboard_logs \
     --report_to tensorboard

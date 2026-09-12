@@ -56,7 +56,7 @@ torchrun --standalone --nnodes=1 --nproc_per_node=8 \
     --system1 "none" \
     \
     --output_dir ${output_dir} \
-    --num_train_epochs 2.0 \
+    --num_train_epochs 4.0 \
     --per_device_train_batch_size ${batch_size} \
     --gradient_accumulation_steps ${grad_accum_steps} \
     --max_pixels ${max_pixels} \
@@ -74,7 +74,7 @@ torchrun --standalone --nnodes=1 --nproc_per_node=8 \
     --logging_steps 10 \
     --model_max_length 8192 \
     --gradient_checkpointing True \
-    --dataloader_num_workers 12 \
+    --dataloader_num_workers 8 \
     --run_name ${run_name} \
     --logging_dir ${output_dir}/tensorboard_logs \
     --report_to tensorboard
