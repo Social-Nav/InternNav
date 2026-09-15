@@ -145,22 +145,26 @@ class InternVLAN1MetaModel:
                 raise NotImplementedError
 
     def initialize_vision_modules(self, model_args):
+        # Runs after from_pretrained; rebuild only what the checkpoint lacked.
         if 'nextdit' in model_args.system1:
-            self.traj_dit, self.noise_scheduler = build_traj_dit(model_args)
-            self.action_encoder = nn.Linear(3, 384, bias=True)
-            self.pos_encoding = SinusoidalPositionalEncoding(384)
-            self.action_decoder = nn.Linear(384, 3, bias=True)
+            if getattr(self, 'traj_dit', None) is None:
+                self.traj_dit, self.noise_scheduler = build_traj_dit(model_args)
+                self.action_encoder = nn.Linear(3, 384, bias=True)
+                self.pos_encoding = SinusoidalPositionalEncoding(384)
+                self.action_decoder = nn.Linear(384, 3, bias=True)
 
-            self.cond_projector = nn.Sequential(
-                nn.Linear(3584, LatentEmbSize), nn.GELU(approximate="tanh"), nn.Linear(LatentEmbSize, LatentEmbSize)
-            )
+                self.cond_projector = nn.Sequential(
+                    nn.Linear(3584, LatentEmbSize),
+                    nn.GELU(approximate="tanh"),
+                    nn.Linear(LatentEmbSize, LatentEmbSize),
+                )
 
-            if 'async' in model_args.system1:
+            if 'async' in model_args.system1 and getattr(self, 'rgb_model', None) is None:
                 self.rgb_model = build_depthanythingv2(model_args)
                 self.memory_encoder = MemoryEncoder()
                 self.rgb_resampler = QFormer()
         elif 'navdp' in model_args.system1:
-            if 'async' in model_args.system1:
+            if 'async' in model_args.system1 and getattr(self, 'navdp', None) is None:
                 self.navdp = build_navdp(model_args, memory_size=2)
         else:
             raise NotImplementedError

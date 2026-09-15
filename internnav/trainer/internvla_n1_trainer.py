@@ -46,6 +46,52 @@ from internnav.trainer.internvla_n1_argument import (
 )
 
 
+SYSTEM1_MODULES = (
+    'traj_dit',
+    'action_encoder',
+    'action_decoder',
+    'cond_projector',
+    'memory_encoder',
+    'rgb_resampler',
+    'rgb_model',
+    'navdp',
+    'latent_queries',
+)
+
+
+def load_system1_weights(model, ckpt_dir):
+    """Seed System 1 from a dual-system checkpoint, leaving System 2 alone."""
+    import glob
+
+    from safetensors.torch import load_file
+
+    shards = sorted(glob.glob(os.path.join(ckpt_dir, '*.safetensors')))
+    if not shards:
+        shards = sorted(glob.glob(os.path.join(ckpt_dir, 'pytorch_model*.bin')))
+    if not shards:
+        raise FileNotFoundError(f"no weight shards under {ckpt_dir}")
+
+    target = model.get_model()
+    own = set(target.state_dict().keys())
+    picked = {}
+    for shard in shards:
+        blob = load_file(shard) if shard.endswith('.safetensors') else torch.load(shard, map_location='cpu')
+        for k, v in blob.items():
+            name = k[len('model.') :] if k.startswith('model.') else k
+            if name in own and name.split('.')[0] in SYSTEM1_MODULES:
+                picked[name] = v
+
+    missing = [n for n in own if n.split('.')[0] in SYSTEM1_MODULES and n not in picked]
+    if not picked:
+        raise RuntimeError(f"{ckpt_dir} holds no System 1 weights; is it a dual-system checkpoint?")
+
+    target.load_state_dict(picked, strict=False)
+    if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+        print(f"System 1 seeded from {ckpt_dir}: {len(picked)} tensors loaded")
+        if missing:
+            print(f"  {len(missing)} left at init, e.g. {missing[:3]}")
+
+
 def safe_save_model_for_hf_trainer(trainer: transformers.Trainer, output_dir: str):
     """Collects the state dict and dump to disk."""
 
@@ -204,6 +250,8 @@ def train(attn_implementation="flash_attention_2"):
 
     if data_args.model_type == "internvla-n1":
         model.get_model().initialize_vision_modules(model_args=model_args)
+        if model_args.system1_ckpt:
+            load_system1_weights(model, model_args.system1_ckpt)
     set_model(model_args, model)
 
     if torch.distributed.get_rank() == 0:

@@ -13,6 +13,8 @@ class ModelArguments:
 
     system1: Optional[str] = field(default='nextdit')
     n_query: int = field(default=4)
+    # Dual-system checkpoint to seed System 1 from; unset means random init.
+    system1_ckpt: Optional[str] = field(default=None)
 
 
 @dataclass
