@@ -125,7 +125,7 @@ SCALEVLN_60CM_30_30 = {
 }
 
 SOCIALNAV_132CM_30_30 = {
-    "data_path": "traj_data/socialnav",
+    "data_path": "traj_data/social_gen/grscenes",
     "height": 132,
     "pitch_1": 30,
     "pitch_2": 30,
@@ -724,12 +724,12 @@ def subsample_trajectory_arclength_capped(points, sample_length=33, interval=TRA
 def xy_to_delta_xyt(poses):
     """Absolute poses -> per-step increments [dx, dy, dyaw].
 
-    With a yaw column, dyaw is the logged heading change. Without one, falls back
-    to upstream behaviour: heading from arctan2(dy, dx), with row 0 holding the
-    first segment's absolute bearing rather than an increment.
+    Heading comes from arctan2(dy, dx), matching the convention the pretrained
+    System 1 was trained under. Row 0 holds the first segment's absolute bearing
+    rather than an increment. A yaw column, if present, is ignored.
 
     Args:
-        poses: (N, 2) [x, y] or (N, 3) [x, y, yaw] in radians.
+        poses: (N, 2) [x, y] or (N, 3) [x, y, yaw]; only xy is read.
 
     Returns:
         (N-1, 3) increments; dx, dy unscaled (caller applies the norm).
@@ -737,13 +737,9 @@ def xy_to_delta_xyt(poses):
     poses = np.asarray(poses, dtype=np.float64)
     vectors = np.diff(poses[:, :2], axis=0)  # [N-1, 2]
 
-    if poses.shape[1] >= 3:
-        delta_yaw = np.diff(poses[:, 2])
-        delta_yaw = (delta_yaw + np.pi) % (2 * np.pi) - np.pi  # wrap to [-pi, pi]
-    else:
-        yaw = np.arctan2(vectors[:, 1], vectors[:, 0])
-        delta_yaw = (np.diff(yaw) + np.pi) % (2 * np.pi) - np.pi
-        delta_yaw = np.concatenate([[yaw[0]], delta_yaw])
+    yaw = np.arctan2(vectors[:, 1], vectors[:, 0])
+    delta_yaw = (np.diff(yaw) + np.pi) % (2 * np.pi) - np.pi  # wrap to [-pi, pi]
+    delta_yaw = np.concatenate([[yaw[0]], delta_yaw])
 
     return np.concatenate([vectors, delta_yaw[:, None]], axis=1)
 
