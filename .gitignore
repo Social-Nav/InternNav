@@ -161,3 +161,7 @@ traj_data/
 
 # papers / reference PDFs kept locally
 docs/*.pdf
+
+# local tooling, not part of the repo
+scripts/preflight_train_check.py
+scripts/data/check_dataset_stats.py
