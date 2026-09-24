@@ -43,6 +43,9 @@ min_pixels=3136
 
 vln_datasets=socialnav_132cm_30_30
 
+## Stage 2a
+# run_name=InternVLA-N1-DualVLN-SocialGen
+## Stage 2b
 run_name=InternVLA-N1-DualVLN-SocialGen
 output_dir=checkpoints/${run_name}
 
@@ -50,9 +53,14 @@ output_dir=checkpoints/${run_name}
 system2_ckpt=checkpoints/InternVLA-N1-System2-SocialGen
 
 # Optional: dual-system checkpoint to seed System 1 from. Unset to start random.
-system1_ckpt=checkpoints/InternVLA-N1-DualVLN
+## Stage 2a
+# system1_ckpt=checkpoints/InternVLA-N1-DualVLN
+
+## Stage 2b
+system1_ckpt=checkpoints/InternVLA-N1-w-NavDP
 
 # system1 options: nextdit_async, navdp_async, nextdit
+# system1=nextdit_async
 system1=nextdit_async
 
 torchrun --standalone --nnodes=1 --nproc_per_node=8 \

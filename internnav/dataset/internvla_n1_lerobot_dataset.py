@@ -841,6 +841,9 @@ class NavPixelGoalDataset(Dataset):
         self.predict_step_num = data_args.predict_step_num
         self.pixel_goal_only = data_args.pixel_goal_only
         self.num_future_steps = data_args.num_future_steps
+        self.turn_sample_repeat = data_args.turn_sample_repeat
+        if self.turn_sample_repeat < 0:
+            raise ValueError(f"turn_sample_repeat must be >= 0, got {self.turn_sample_repeat}")
 
         self.list_data_dict = []
 
@@ -938,10 +941,16 @@ class NavPixelGoalDataset(Dataset):
                 )
 
             list_data_dict = pixel_goal_list
-            rank0_print(len(turn_list), len(pixel_goal_list), len(stop_list))
             if not self.pixel_goal_only:
-                list_data_dict += turn_list
+                list_data_dict += turn_list * self.turn_sample_repeat
                 list_data_dict += stop_list * 5
+            rank0_print(
+                "samples: "
+                f"turn={len(turn_list)} x {self.turn_sample_repeat if not self.pixel_goal_only else 0}, "
+                f"pixel_goal={len(pixel_goal_list)}, "
+                f"stop={len(stop_list)} x {5 if not self.pixel_goal_only else 0}, "
+                f"total={len(list_data_dict)}"
+            )
             if sampling_rate < 1.0:
                 list_data_dict = random.sample(list_data_dict, int(len(list_data_dict) * sampling_rate))
                 print(f"sampling {len(list_data_dict)} examples from dataset {data}")
@@ -1012,44 +1021,73 @@ class NavPixelGoalDataset(Dataset):
         images = []
         grid_thws = []
         traj_images = []
-        traj_depths = []  # optional
+        traj_depths = []
 
-        for id in range(0, end_frame_id):
-            image_file = os.path.join(
-                video, f"observation.images.rgb.{height}cm_{pitch_1}deg", f"episode_{ep_id:06d}_{id}.jpg"
+        def rgb_path(frame_id, pitch):
+            return os.path.join(
+                video,
+                f"observation.images.rgb.{height}cm_{pitch}deg",
+                f"episode_{ep_id:06d}_{frame_id}.jpg",
             )
-            image = Image.open(image_file).convert('RGB')
-            lookdown_image = Image.open(image_file.replace(f'_{pitch_1}deg', f'_{pitch_2}deg')).convert('RGB')
 
-            depth_image = None
-            if self.pixel_goal_only:
-                depth_image = Image.open(
-                    image_file.replace(f'_{pitch_1}deg', f'_{pitch_2}deg')
-                    .replace('rgb', 'depth')
-                    .replace('.jpg', '.png')
-                )
+        def load_rgb(frame_id, pitch):
+            with Image.open(rgb_path(frame_id, pitch)) as image:
+                return image.convert('RGB')
 
-                depth_image, resize_shape = self.preprocess_depth_image_v2(
-                    depth_image, do_depth_scale=True, depth_scale=1000, target_height=224, target_width=224
+        def load_depth(frame_id):
+            depth_path = os.path.join(
+                video,
+                f"observation.images.depth.{height}cm_{pitch_2}deg",
+                f"episode_{ep_id:06d}_{frame_id}.png",
+            )
+            with Image.open(depth_path) as depth_image:
+                depth_image, _ = self.preprocess_depth_image_v2(
+                    depth_image,
+                    do_depth_scale=True,
+                    depth_scale=1000,
+                    target_height=224,
+                    target_width=224,
                 )
-                depth_image = torch.as_tensor(np.ascontiguousarray(depth_image)).float()  # [H, W]
-            if id in history_id or id == start_frame_id:
-                if self.data_args.transform_train is not None:
-                    image = self.data_args.transform_train(image)
-                image, grid_thw = self.process_image_unified(image)
-                images.append(image)
-                grid_thws.append(grid_thw)
-                if id == start_frame_id and pose is not None:
-                    image, grid_thw = self.process_image_unified(lookdown_image)
-                    images.append(image)
-                    grid_thws.append(grid_thw)
-                    traj_images.append(lookdown_image)
-                    if depth_image is not None:
-                        traj_depths.append(depth_image)
-            elif id > start_frame_id:
-                traj_images.append(lookdown_image)
-                if depth_image is not None:
-                    traj_depths.append(depth_image)
+            return torch.as_tensor(np.ascontiguousarray(depth_image)).float()
+
+        # System2 conditions both stages on sparse history plus the current main-view RGB.
+        for frame_id in history_id:
+            image = load_rgb(frame_id, pitch_1)
+            if self.data_args.transform_train is not None:
+                image = self.data_args.transform_train(image)
+            image, grid_thw = self.process_image_unified(image)
+            images.append(image)
+            grid_thws.append(grid_thw)
+
+        current_main = load_rgb(start_frame_id, pitch_1)
+        main_input = current_main.copy()
+        if self.data_args.transform_train is not None:
+            main_input = self.data_args.transform_train(main_input)
+        main_input, grid_thw = self.process_image_unified(main_input)
+        images.append(main_input)
+        grid_thws.append(grid_thw)
+
+        current_lookdown = None
+        if pose is not None:
+            current_lookdown = current_main if pitch_1 == pitch_2 else load_rgb(start_frame_id, pitch_2)
+            lookdown_input, grid_thw = self.process_image_unified(current_lookdown)
+            images.append(lookdown_input)
+            grid_thws.append(grid_thw)
+
+        if self.pixel_goal_only:
+            goal_len = end_frame_id - start_frame_id - 1
+            interval = 2
+            frame_offsets = np.arange(0, goal_len, interval)
+            max_len = 12
+            if len(frame_offsets) > max_len:
+                interval = int(np.ceil(goal_len / max_len))
+                frame_offsets = np.arange(0, goal_len, interval)
+
+            for offset in frame_offsets:
+                frame_id = start_frame_id + int(offset)
+                lookdown_image = current_lookdown if offset == 0 else load_rgb(frame_id, pitch_2)
+                traj_images.append(np.asarray(lookdown_image.resize((224, 224))))
+                traj_depths.append(load_depth(frame_id))
 
         history_imgs = "<image>\n" * len(history_id)
 
@@ -1118,17 +1156,10 @@ class NavPixelGoalDataset(Dataset):
         data_dict["image_grid_thw"] = torch.cat([thw.unsqueeze(0) for thw in grid_thws], dim=0)
 
         if self.pixel_goal_only:
-            goal_len = end_frame_id - start_frame_id - 1
-            interval = 2
-            frame_ids = np.arange(0, goal_len, interval)
-            max_len = 12
-            traj_images = torch.tensor(np.stack([np.asarray(timg.resize((224, 224))) for timg in traj_images])) / 255.0
-            if len(frame_ids) > max_len:
-                interval = int(np.ceil(goal_len / max_len))
-                frame_ids = np.arange(0, goal_len, interval)
+            traj_images = torch.tensor(np.stack(traj_images)) / 255.0
 
             traj_poses_gt = []
-            for cid in frame_ids:
+            for cid in frame_offsets:
                 discrete_traj_pose = get_trajectory_relative_to_frame(pose[cid:], camera_deg=pitch_2)
                 rel_trajectory, rel_pose_resample = interpolate_and_resample_trajectory(
                     discrete_traj_pose, self.predict_step_num
@@ -1136,8 +1167,8 @@ class NavPixelGoalDataset(Dataset):
                 rel_pose_resample = clip_or_pad(rel_pose_resample, self.predict_step_num)
                 traj_poses_gt.append(torch.tensor(rel_pose_resample))
 
-            data_dict["traj_images"] = traj_images[:goal_len][::interval]
-            data_dict["traj_depths"] = torch.stack(traj_depths[:goal_len][::interval])
+            data_dict["traj_images"] = traj_images
+            data_dict["traj_depths"] = torch.stack(traj_depths)
             data_dict["traj_poses"] = torch.stack(traj_poses_gt)
         return data_dict
 

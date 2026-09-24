@@ -41,6 +41,10 @@ class DataArguments:
     resize_h: Optional[int] = field(default=384)
     resize_w: Optional[int] = field(default=384)
     num_future_steps: Optional[int] = field(default=4)
+    turn_sample_repeat: int = field(
+        default=1,
+        metadata={"help": "Number of times to include each turn sample when pixel_goal_only is False."},
+    )
     max_dialog_turns: Optional[int] = field(default=6)
 
 

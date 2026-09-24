@@ -1,10 +1,12 @@
-# InternVLA-N1 System2 微调流程（8×A100 80G / SocialNav）
+# InternVLA-N1 微调流程（8×A100 80G / SocialGen）
 
 面向已经对齐 InternNav LeRobot 格式的自有数据集。数据转换与标签生成（`gen_pixel_goal_labels.py` 等）不在本文范围内。
 
 - 数据集 setting：`height=132`, `pitch_1=30`, `pitch_2=30` → 列名后缀 `132cm_30deg`
-- 起点权重：官方 `InternRobotics/InternVLA-N1-System2`
-- 训练脚本：`scripts/train/qwenvl_train/train_system2_socialnav.sh`
+- 第 0-8 节：Stage1（微调 System 2），起点是官方 `InternRobotics/InternVLA-N1-System2`，
+  脚本 `scripts/train/qwenvl_train/train_system2_socialgen.sh`
+- 第 9 节：Stage2（冻结 System 2，训 System 1），脚本 `train_dual_system_socialgen.sh`，
+  含 navdp / nextdit 切换要改的参数
 
 ---
 
@@ -17,7 +19,7 @@
 ```
 InternNav/                                    ← 所有命令的 CWD
 ├── traj_data/
-│   └── socialnav/                            ← 你的数据集
+│   └── social_gen/grscenes/                  ← 你的数据集（data_dict 的 data_path）
 │       ├── scene_001/
 │       │   ├── meta/episodes.jsonl
 │       │   ├── data/chunk-000/episode_000000.parquet
@@ -26,21 +28,28 @@ InternNav/                                    ← 所有命令的 CWD
 │       │       └── observation.images.depth.132cm_30deg/episode_000000_0.png
 │       └── scene_002/ ...
 ├── checkpoints/
-│   ├── qwen2.5-vl-n1s2-base/                 ← 官方 System2 权重（微调起点）
-│   └── InternVLA-N1-System2-SocialNav/       ← 训练输出（自动创建）
-└── scripts/train/qwenvl_train/train_system2_socialnav.sh
+│   ├── qwen2.5-vl-n1s2-base/                 ← 官方 System2 权重（Stage1 起点）
+│   ├── InternVLA-N1-System2-SocialGen/       ← Stage1 输出（自动创建）
+│   ├── InternVLA-N1-DualVLN/                 ← Stage2 nextdit 的 System1 起点
+│   ├── InternVLA-N1-w-NavDP/                 ← Stage2 navdp 的 System1 起点
+│   ├── depth_anything_v2_metric_hypersim_vits.pth   ← Stage2 必需
+│   └── InternVLA-N1-DualVLN-SocialGen/       ← Stage2 输出（自动创建）
+└── scripts/train/qwenvl_train/
+    ├── train_system2_socialgen.sh            ← Stage1
+    └── train_dual_system_socialgen.sh        ← Stage2
 ```
 
 数据或权重在别的挂载点时用软链接，不要改代码里的相对路径：
 
 ```bash
-ln -s /mnt/data/my_socialnav        traj_data/socialnav
+mkdir -p traj_data/social_gen
+ln -s /mnt/data/my_socialnav        traj_data/social_gen/grscenes
 ln -s /mnt/models/internvla_ckpts   checkpoints
 ```
 
 ### 目录命名的硬约束
 
-`internvla_n1_trainer.py:149-181` 用**路径字符串**分派模型类，三个分支互斥：
+`internvla_n1_trainer.py:195-227` 用**路径字符串**分派模型类，三个分支互斥：
 
 | 路径小写后 | 命中 | 结果 |
 |---|---|---|
@@ -52,7 +61,7 @@ ln -s /mnt/models/internvla_ckpts   checkpoints
 `InternRobotics/InternVLA-N1-System2`（它本身含 `internvla-n1-system2`，必崩）。
 
 反过来，Stage2 的 `system2_ckpt` 要求路径**含** `internvla-n1-system2`。
-本文的输出目录 `InternVLA-N1-System2-SocialNav` 已满足，接 Stage2 时无需改名。
+本文的输出目录 `InternVLA-N1-System2-SocialGen` 已满足，接 Stage2 时无需改名。
 
 评测配置 `scripts/eval/configs/habitat_s2_cfg.py:9` 写死了 `checkpoints/InternVLA-N1-System2`，
 需要时做个软链接即可，磁盘上只有一份权重。
@@ -64,7 +73,7 @@ ln -s /mnt/models/internvla_ckpts   checkpoints
 ```bash
 cd /path/to/InternNav
 
-pip install -r requirements/model_requirements.txt
+pip install -r requirements/internvla_n1.txt
 pip install -e .
 
 python -c "import torch, transformers, deepspeed; \
@@ -91,7 +100,7 @@ print('hidden:', c.get('hidden_size') or c.get('text_config',{}).get('hidden_siz
 若 hidden_size 是 2048（3B），后续接 Stage2 会与 `cond_projector` 的硬编码 3584 维度冲突。
 
 不需要 wandb 账号：脚本用 `--report_to tensorboard`，`tensorboard` 已在
-`requirements/model_requirements.txt` 中。
+`requirements/internvla_n1.txt` 中。
 
 ---
 
@@ -101,7 +110,7 @@ print('hidden:', c.get('hidden_size') or c.get('text_config',{}).get('hidden_siz
 
 ```python
 SOCIALNAV_132CM_30_30 = {
-    "data_path": "traj_data/socialnav",
+    "data_path": "traj_data/social_gen/grscenes",
     "height": 132,
     "pitch_1": 30,
     "pitch_2": 30,
@@ -110,9 +119,9 @@ SOCIALNAV_132CM_30_30 = {
 
 三个字段的用途（不是命令行参数，只能在这里改）：
 
-- `height` + `pitch_2` → `setting = "132cm_30deg"`，决定读哪几列 parquet（`:850`）
-- `pitch_1` → RGB 目录名 `observation.images.rgb.132cm_30deg`（`:1015`）
-- `pitch_2` → lookdown 图与 depth 目录名（`:1018-1021`）
+- `height` + `pitch_2` → `setting = "132cm_30deg"`，决定读哪几列 parquet（`:854`）
+- `pitch_1` → RGB 目录名 `observation.images.rgb.132cm_30deg`（`:1019`）
+- `pitch_2` → lookdown 图与 depth 目录名（`:1022-1030`）
 
 本例 `pitch_1 == pitch_2`，`replace` 是恒等操作，lookdown 与主观测是同一张图。
 这与官方 `r2r_60cm_30_30` 的用法一致，是受支持的配置。
@@ -124,10 +133,10 @@ SOCIALNAV_132CM_30_30 = {
 
 ### 3.1 为什么必须校验
 
-`get_annotations_from_lerobot_data`（`:793-799`）在列名缺失时**只打印一行 warning**，
-不抛异常也不填默认值，随后第 802 行引用未赋值的 `ep_poses`：
+`get_annotations_from_lerobot_data`（`:788-795`）在列名缺失时**只打印一行 warning**，
+不抛异常也不填默认值，随后第 806 行引用未赋值的 `ep_poses`：
 
-- 首个 episode 就缺列 → `UnboundLocalError` → 被 `:816` 的 `except Exception` 吞掉 → **整个 scene 静默丢弃**
+- 首个 episode 就缺列 → `UnboundLocalError` → 被 `:820` 的 `except Exception` 吞掉 → **整个 scene 静默丢弃**
 - 部分 episode 缺列 → `ep_poses` 残留上一 episode 的值 → **数据静默错配，训练照跑**
 
 两种情况都不会让训练崩，只会让你训出垃圾。所以先跑校验。
@@ -141,7 +150,7 @@ python - <<'EOF'
 import os, json, glob
 import pyarrow.parquet as pq
 
-ROOT, H, P1, P2 = "traj_data/socialnav", 132, 30, 30
+ROOT, H, P1, P2 = "traj_data/social_gen/grscenes", 132, 30, 30
 setting = f"{H}cm_{P2}deg"
 need = [f"pose.{setting}", f"goal.{setting}", f"relative_goal_frame_id.{setting}", "action"]
 
@@ -209,7 +218,7 @@ print(data_dict['socialnav_132cm_30_30'])"
 
 ## 4. 训练参数
 
-脚本：`scripts/train/qwenvl_train/train_system2_socialnav.sh`
+脚本：`scripts/train/qwenvl_train/train_system2_socialgen.sh`
 
 | 参数 | 值 | 相对官方脚本的改动理由 |
 |---|---|---|
@@ -239,7 +248,7 @@ print(data_dict['socialnav_132cm_30_30'])"
 cd /path/to/InternNav          # 必须；trainer 里 `import qwenvl_base` 是裸 import
 
 tmux new -s train              # 防 SSH 断开
-bash scripts/train/qwenvl_train/train_system2_socialnav.sh 2>&1 | tee train.log
+bash scripts/train/qwenvl_train/train_system2_socialgen.sh 2>&1 | tee train.log
 # Ctrl+B D 脱离； tmux attach -t train 回来
 ```
 
@@ -252,24 +261,25 @@ bash scripts/train/qwenvl_train/train_system2_socialnav.sh 2>&1 | tee train.log
 ### ① 数据集配置回显（约 10 秒）
 
 ```
-Loading datasets: [{'data_path': 'traj_data/socialnav', 'height': 132,
+Loading datasets: [{'data_path': 'traj_data/social_gen/grscenes', 'height': 132,
                     'pitch_1': 30, 'pitch_2': 30, 'sampling_rate': 1.0}]
 ```
 
-来源 `:827`。`data_path` 不对就是软链接错了。
+来源 `:831`。`data_path` 不对就是软链接错了。
 
 ### ② 样本统计 —— **最关键的一行**
 
 ```
-1523 8734 412
+samples: turn=1523 x 1, pixel_goal=8734, stop=412 x 5, total=12317
 ```
 
-来源 `:937`，三个数依次是 `len(turn_list) len(pixel_goal_list) len(stop_list)`。
+来源 `NavPixelGoalDataset` 的样本组装日志。`turn_sample_repeat` 可控制 turn 样本的重复次数；
+例如设为 3 时，turn 部分贡献 `1523 × 3` 个训练样本。
 
 - **中间那个（pixel_goal）为 0 → 立刻停**。说明列名不匹配或 goal 全是 -1，
   继续跑只是在浪费卡时。回到第 3 节校验。
 - 第三个（stop）应约等于 `episode 数 × 指令数`
-- 最终训练样本数 = `pixel_goal + turn + stop×5`（`pixel_goal_only=False` 时，`:938-940`）
+- 最终训练样本数 = `pixel_goal + turn×turn_sample_repeat + stop×5`
 
 这一步要遍历全部 parquet，数据多时可能几分钟无输出，属正常。
 
@@ -290,7 +300,7 @@ Stage1 三个 `tune_*` 全 True，所以应该**全部可训练、Non-Trainable 
 
 ### ④ 参数表
 
-`tabulate` 打出的 idx/name/shape/trainable 全表（trainer `:220-224`），很长，扫一眼 trainable 列即可。
+`tabulate` 打出的 idx/name/shape/trainable 全表（trainer `:266-272`），很长，扫一眼 trainable 列即可。
 
 ### ⑤ DeepSpeed 初始化
 
@@ -334,7 +344,7 @@ watch -n 2 nvidia-smi
 ## 7. 监控曲线
 
 ```bash
-tensorboard --logdir checkpoints/InternVLA-N1-System2-SocialNav/runs \
+tensorboard --logdir checkpoints/InternVLA-N1-System2-SocialGen/runs \
             --port 6006 --bind_all
 ```
 
@@ -347,9 +357,9 @@ ssh -L 6006:localhost:6006 user@server     # 之后开 http://localhost:6006
 SCALARS 页有 `train/loss`、`train/grad_norm`、`train/learning_rate`、`train/epoch`。
 
 **没有验证集曲线**：脚本 `--eval_strategy "no"`，且 `make_supervised_data_module`
-返回 `eval_dataset=None`（`:1381`）。判断是否过拟合只能靠：
+返回 `eval_dataset=None`（`:1391`）。判断是否过拟合只能靠：
 
-1. 延长 `num_train_epochs` 续训，看 loss 是否还降（`output_dir` 有 `checkpoint-*` 会自动续训，trainer `:225`）
+1. 延长 `num_train_epochs` 续训，看 loss 是否还降（`output_dir` 有 `checkpoint-*` 会自动续训，trainer `:275`）
 2. 拿 ckpt 跑 `scripts/eval/bash/eval_system2.sh`（需装 habitat-sim）
 3. `scripts/notebooks/inference_only_demo.ipynb` 改 model_path 看几个样例输出
 
@@ -358,22 +368,165 @@ SCALARS 页有 `train/loss`、`train/grad_norm`、`train/learning_rate`、`train
 ## 8. 产出与后续
 
 ```
-checkpoints/InternVLA-N1-System2-SocialNav/
+checkpoints/InternVLA-N1-System2-SocialGen/
 ├── checkpoint-500/     ← 完整 HF 模型，可直接 from_pretrained
 ├── checkpoint-1000/
 └── ...                 ← save_total_limit=5，只留最新 5 个
 ```
 
-接 Stage2 双系统联合训练时：
-
-- `system2_ckpt=checkpoints/InternVLA-N1-System2-SocialNav`（名字已含 `internvla-n1-system2`，直接可用）
-- `system1=nextdit_async`，需下载 `depth_anything_v2_metric_hypersim_vits.pth` 放到 `checkpoints/`
-- `tune_mm_vision/mlp/llm` 全设 `False`，`pixel_goal_only True`，`lr` 提到 1e-4
-- `predict_step_num` 必须与 Stage1 一致（32）
+接 Stage2 时 `system2_ckpt=checkpoints/InternVLA-N1-System2-SocialGen`
+（名字已含 `internvla-n1-system2`，直接可用）。详见第 9 节。
 
 ---
 
-## 9. 排错速查
+## 9. Stage2 双系统联合训练
+
+脚本：`scripts/train/qwenvl_train/train_dual_system_socialgen.sh`
+
+同一个 `internvla_n1_trainer.py`，靠参数区分 stage：Stage2 把 `tune_mm_vision/mlp/llm`
+全设 `False` 冻住整个 VLM，再由 `set_model`（trainer:124-169）按 `--system1` 解冻
+System 1 模块 + `latent_queries`（prompt tuning，论文 §3.2）。
+
+### 9.1 前置条件
+
+1. Stage1 已跑完，`--model_name_or_path` 指向其输出目录，**名字必须含
+   `internvla-n1-system2`**，否则 trainer:195 分派到 `Qwen2VLForConditionalGeneration`，
+   该类根本没有 System 1 模块。第 8 节的输出目录名已满足。
+2. DAv2 ViT-S 权重放在 `checkpoints/depth_anything_v2_metric_hypersim_vits.pth`
+   （`internvla_n1_arch.py:36` 硬编码；`navdp_backbone.py:110` 已改成同一份，两个分支共用）。
+3. `socialnav_132cm_30_30` 已注册（第 2 节）。
+4. 数据集必须有 depth 目录：`navdp` 分支的 `rgbd_encoder` 要吃 `traj_depths`。
+
+### 9.2 切换 nextdit / navdp 要改的参数
+
+**只有 `system1` 和 `system1_ckpt` 两个，且必须同源。**
+
+| | `nextdit_async` | `navdp_async` |
+|---|---|---|
+| `system1` | `nextdit_async` | `navdp_async` |
+| `system1_ckpt` | `checkpoints/InternVLA-N1-DualVLN` | `checkpoints/InternVLA-N1-w-NavDP` |
+| 权重 key 前缀 | `traj_dit.*` | `navdp.*` |
+| 期望加载张量数 | **609** | **733**（多 `rgbd_encoder.depth_model` 175） |
+| `rgb_model` | 训练 | 冻结（`set_model`（trainer:166）排除 `"rgb_model"`） |
+
+两者不一致会静默出错：`system1_ckpt` 只按顶层模块名筛 key，navdp 的权重里没有
+`traj_dit.*`，筛完是空的 → `load_system1_weights` 抛 `RuntimeError`；
+反向（nextdit 权重 + `navdp_async`）能筛出 `latent_queries` 等少量 key
+但 `navdp.*` 全随机。preflight 的 variant-match 检查专门拦这个。
+
+**不要动的**：
+
+- `predict_step_num=32` — `build_navdp`（`internvla_n1_arch.py:13`）**不转发**这个值，
+  navdp 内部 `predict_size` 恒为 32（`navdp.py:21`）。改了 sh 里的值只会让数据集吐
+  N 行而 `out_pos_embed` 还是 32，直接崩。
+- `n_query=4` — 两份官方 ckpt 的 `config.json` 都是 4。改了之后 `__init__` 建出
+  `(1, N, 3584)` 的 `latent_queries`，与 ckpt 的 `(1, 4, 3584)` 形状不符，
+  `strict=False` 会**静默跳过**，等于白加载。
+- `pixel_goal_only True`、`tune_mm_*` 全 `False`。
+
+### 9.3 相对 Stage1 的参数改动
+
+| 参数 | Stage1 | Stage2 | 理由 |
+|---|---|---|---|
+| `tune_mm_vision/mlp/llm` | 全 `True` | 全 `False` | 冻结 System 2 |
+| `pixel_goal_only` | `False` | `True` | 打开轨迹监督；样本只保留 `pixel_goal_list` |
+| `system1` | `"none"` | `nextdit_async` / `navdp_async` | — |
+| `learning_rate` | 2e-5 | **1e-4** | 只训随机/预训练的小模块，可以放开 |
+| `vision_tower_lr` | 5e-6 | 不传 | visual 已冻结 |
+| `lr_scheduler_type` | `cosine` | `cosine_with_min_lr`（min 1e-5） | 扩散 loss 尾段别衰到 0 |
+| `per_device_train_batch_size` | 4 | **2** | 每样本额外带 ≤12 帧 224² RGB+depth |
+| `sample_step` | 30 | **10** | 窗口密一些，轨迹样本量够 |
+| `num_train_epochs` | 4.0 | 3.0 | — |
+
+轨迹标签的间隔参数 `TRAJ_ARC_INTERVAL = 0.1`（米）在
+`internvla_n1_lerobot_dataset.py:581`，**不在 sh 里**。监督窗口长度 =
+`predict_step_num × TRAJ_ARC_INTERVAL` = 3.2 m。
+
+### 9.4 启动前校验
+
+```bash
+cd /path/to/InternNav
+
+# nextdit
+python scripts/preflight_train_check.py --stage 2 \
+    --model-name-or-path checkpoints/InternVLA-N1-System2-SocialGen \
+    --system1 nextdit_async \
+    --system1-ckpt checkpoints/InternVLA-N1-DualVLN
+
+# navdp：换掉最后两个参数即可
+python scripts/preflight_train_check.py --stage 2 \
+    --model-name-or-path checkpoints/InternVLA-N1-System2-SocialGen \
+    --system1 navdp_async \
+    --system1-ckpt checkpoints/InternVLA-N1-w-NavDP
+```
+
+六项检查：包版本、模型类分派、ckpt config、DAv2 权重、`system1_ckpt` 的 key
+数量与变体匹配、数据集注册。
+
+**preflight 查不到的两件事**，要另外确认：
+
+1. **分片是否下齐**。有 `model.safetensors.index.json` 时 preflight 直接读索引，
+   即使某个 shard 文件不在磁盘上也照样数出 733。补一句：
+
+   ```bash
+   python -c "
+   import json,os,glob
+   d='checkpoints/InternVLA-N1-w-NavDP'
+   want=set(json.load(open(d+'/model.safetensors.index.json'))['weight_map'].values())
+   have={os.path.basename(p) for p in glob.glob(d+'/*.safetensors')}
+   print('missing:', sorted(want-have) or 'none')"
+   ```
+
+2. **形状是否对得上**。`load_state_dict(strict=False)` 遇到尺寸不符是静默跳过的，
+   只能靠 9.6 的张量计数验证。
+
+### 9.5 启动
+
+```bash
+cd /path/to/InternNav
+tmux new -s train2
+bash scripts/train/qwenvl_train/train_dual_system_socialgen.sh 2>&1 | tee train_stage2.log
+```
+
+### 9.6 启动后必须确认的三行
+
+**① System 1 权重计数**（`load_system1_weights`，trainer:90）
+
+```
+System 1 seeded from checkpoints/InternVLA-N1-DualVLN: 609 tensors loaded
+```
+
+609（nextdit）/ 733（navdp）。数字明显偏小 → 形状不匹配被静默跳过，
+或 `n_query` 被改过。这行完全没有 → `--system1_ckpt` 没传，System 1 全随机。
+
+**② 样本统计**（显示 turn 原始数量与重复倍数、pixel_goal、stop 和 total）
+
+`pixel_goal_only=True` 时只有中间那个数进训练集。**中间为 0 就立刻停**。
+
+**③ 轨迹标签非零**
+
+30 fps 连续采集数据上最容易踩的坑：本仓库已删掉上游 `steps_sq > 0.05` 的过滤
+（那个阈值等价于要求单帧位移 > 0.2236 m，30 fps 下每一帧都会被丢掉，
+`filtered_traj` 塌回原点后被复制 33 份，训练在低 loss 上收敛到"原地不动"，
+全程不报错）。换新的采集数据后，dump 一个 batch 确认：
+
+```python
+print(batch["traj_poses"].shape, batch["traj_poses"].abs().sum())
+# 期望 (B, T, 32, 3)，sum 远大于 0
+```
+
+`loss` 是扩散 MSE，量级与 Stage1 的交叉熵不可比，初值 ~1.0 附近属正常，
+关键看是否下降。
+
+### 9.7 产出
+
+`checkpoint-*` 是 System2 + System1 合并后的完整 HF 模型，`config.json` 里的
+`system1` 字段会被 `initialize_vision_modules:172` 写成本次训练用的值，
+所以下次续训或推理不必再传 `--system1_ckpt`。
+
+---
+
+## 10. 排错速查
 
 | 症状 | 原因 | 处理 |
 |---|---|---|
@@ -386,3 +539,9 @@ checkpoints/InternVLA-N1-System2-SocialNav/
 | 卡在 `wandb: Logging into wandb.ai` | `--report_to wandb` 且无 API key | 用 `tensorboard`；或 `export WANDB_MODE=offline` |
 | GPU 利用率忽高忽低 | 数据加载瓶颈 | 调大 `dataloader_num_workers` |
 | loss 断崖降到近 0 | 数据量太小，过拟合 | 减 epoch；或 `tune_mm_llm False` 只训 merger |
+| Stage2: `RuntimeError: holds no System 1 weights` | `system1` 与 `system1_ckpt` 变体不符 | 见 9.2 的对应表 |
+| Stage2: 没有 "System 1 seeded from" 这行 | 忘了传 `--system1_ckpt` | System 1 会全随机，补上参数 |
+| Stage2: 加载张量数远小于 609/733 | 形状不匹配被 `strict=False` 静默跳过 | 查 `n_query` 是否被改过；查分片是否下齐（9.4） |
+| Stage2: `FileNotFoundError: depth_anything_v2_*.pth` | DAv2 权重不在 `checkpoints/`，或 CWD 不对 | 路径是相对的，必须从仓库根启动 |
+| Stage2: `traj_poses` 全零 | 轨迹标签退化 | 见 9.6 ③ |
+| Stage2: `out_pos_embed` 形状报错 | 改了 `predict_step_num` | 只能是 32，见 9.2 |

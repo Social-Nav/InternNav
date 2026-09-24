@@ -30,8 +30,11 @@ max_pixels=313600
 min_pixels=3136
 
 vln_datasets=socialnav_132cm_30_30
+# Number of times each turn sample is included. 1 keeps the original ratio;
+# 0 removes turn samples; values above 1 oversample turns.
+turn_sample_repeat=1
 
-run_name=InternVLA-N1-System2-SocialNav
+run_name=InternVLA-N1-System2-SocialGen
 output_dir=checkpoints/${run_name}
 
 torchrun --standalone --nnodes=1 --nproc_per_node=8 \
@@ -50,7 +53,8 @@ torchrun --standalone --nnodes=1 --nproc_per_node=8 \
     --resize_h 384 \
     --resize_w 384 \
     --sample_step 30 \
-    --num_future_steps 10 \
+    --num_future_steps 30 \
+    --turn_sample_repeat ${turn_sample_repeat} \
     --predict_step_num 32 \
     --pixel_goal_only False \
     --system1 "none" \

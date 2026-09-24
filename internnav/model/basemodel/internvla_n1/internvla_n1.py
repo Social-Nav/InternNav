@@ -239,9 +239,11 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
                     images_dp = torch.stack([pix_goal_images, cur_images], dim=1).permute(0, 1, 4, 2, 3)
                     images_dp_norm = (images_dp - self._resnet_mean) / self._resnet_std
 
+                    # Collator emits float32 images; rgb_model is bf16 under --bf16.
+                    rgb_dtype = next(self.get_model().rgb_model.parameters()).dtype
                     images_dp_feat = (
                         self.get_model()
-                        .rgb_model.get_intermediate_layers(images_dp_norm.flatten(0, 1))[0]
+                        .rgb_model.get_intermediate_layers(images_dp_norm.flatten(0, 1).to(rgb_dtype))[0]
                         .unflatten(dim=0, sizes=(bsz, -1))
                     )
 
@@ -257,7 +259,8 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
                     traj_hidden_states = self.get_model().cond_projector(traj_hidden_states)
                     latents = traj_hidden_states
 
-                relative_poses = traj_poses.flatten(0, 1)
+                # Labels arrive float64 from numpy; action_encoder is bf16.
+                relative_poses = traj_poses.flatten(0, 1).to(latents.dtype)
                 bsz = relative_poses.shape[0]
                 noise = torch.randn(relative_poses.shape, device=relative_poses.device, dtype=relative_poses.dtype)
                 u = torch.rand(size=(bsz,), device="cpu")
@@ -294,8 +297,12 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
                     depths_dp = torch.stack([pix_goal_depths, cur_depths], dim=1).unsqueeze(
                         -1
                     )  # (bs*select_size, 2, 224, 224, 1)
+                    # Labels arrive float64 from numpy; navdp.input_embed is bf16.
                     pred_pg, noise = self.model.navdp.forward_vlm_traj(
-                        traj_hidden_states, images_dp, depths_dp, tensor_label_actions=traj_poses
+                        traj_hidden_states,
+                        images_dp,
+                        depths_dp,
+                        tensor_label_actions=traj_poses.to(self.model.navdp.input_dtype),
                     )
                     pg_action_loss = (pred_pg - noise).square()
                     mask = loss_mask.flatten(0, 1)[:, None, None]
