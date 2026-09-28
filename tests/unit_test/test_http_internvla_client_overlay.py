@@ -16,6 +16,7 @@ CLIENT_PATH = (
 )
 DEJAVU_SANS = Path('/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf')
 HELPERS = {
+    '_is_terminal_model_stop_response',
     '_semantic_llm_output',
     '_font_supports_overlay_glyphs',
     '_load_overlay_font',
@@ -63,6 +64,27 @@ def test_semantic_llm_output_is_explicit_and_preserves_useful_raw_text(
     overlay_helpers, raw_output, expected
 ):
     assert overlay_helpers['_semantic_llm_output'](raw_output) == expected
+
+
+def test_only_successful_model_stop_is_terminal(overlay_helpers):
+    is_terminal = overlay_helpers['_is_terminal_model_stop_response']
+
+    assert is_terminal({
+        'status': 'internvla_realworld_http_command',
+        'discrete_action': [0],
+    }) is True
+    assert is_terminal({
+        'status': 'internvla_realworld_http_command',
+        'discrete_action': 0,
+    }) is True
+    assert is_terminal({
+        'status': 'internvla_realworld_http_error',
+        'discrete_action': [0],
+    }) is False
+    assert is_terminal({
+        'status': 'internvla_realworld_http_command',
+        'discrete_action': [3],
+    }) is False
 
 
 def test_overlay_font_is_concrete_and_has_distinct_arrow_glyphs(overlay_helpers):

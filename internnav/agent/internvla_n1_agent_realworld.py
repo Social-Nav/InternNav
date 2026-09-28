@@ -1,4 +1,5 @@
 import copy
+import json
 import itertools
 import os
 import re
@@ -167,6 +168,65 @@ def _env_int(name, default, minimum=None, maximum=None):
     return value
 
 
+def _load_system2_checkpoint(model, checkpoint_path):
+    """Overlay a pure Qwen2.5-VL System2 checkpoint onto DualVLN.
+
+    SocialGen publishes the 729 Qwen System2 tensors only. The DualVLN base
+    additionally owns System1 trajectory modules, which must remain loaded from
+    ``model_path``. Require the overlay to be an exact subset with matching
+    shapes/dtypes before changing any parameter.
+    """
+    path = Path(str(checkpoint_path or '')).expanduser().resolve()
+    index_path = path / 'model.safetensors.index.json'
+    if not path.is_dir() or not index_path.is_file():
+        raise RuntimeError(f'invalid System2 checkpoint directory: {path}')
+
+    from safetensors import safe_open
+
+    weight_map = json.loads(index_path.read_text(encoding='utf-8')).get('weight_map')
+    if not isinstance(weight_map, dict) or not weight_map:
+        raise RuntimeError(f'invalid System2 safetensors index: {index_path}')
+    model_state = model.state_dict()
+    missing = sorted(set(weight_map) - set(model_state))
+    if missing:
+        raise RuntimeError(
+            f'System2 checkpoint has {len(missing)} unknown tensors; first={missing[:5]}'
+        )
+
+    by_shard = {}
+    for name, shard in weight_map.items():
+        by_shard.setdefault(str(shard), []).append(str(name))
+    loaded = 0
+    with torch.no_grad():
+        for shard_name, names in sorted(by_shard.items()):
+            shard_path = path / shard_name
+            if not shard_path.is_file():
+                raise RuntimeError(f'missing System2 shard: {shard_path}')
+            with safe_open(shard_path, framework='pt', device='cpu') as shard:
+                for name in names:
+                    source = shard.get_tensor(name)
+                    target = model_state[name]
+                    if tuple(source.shape) != tuple(target.shape):
+                        raise RuntimeError(
+                            f'System2 shape mismatch for {name}: '
+                            f'{tuple(source.shape)} != {tuple(target.shape)}'
+                        )
+                    if source.dtype != target.dtype:
+                        raise RuntimeError(
+                            f'System2 dtype mismatch for {name}: '
+                            f'{source.dtype} != {target.dtype}'
+                        )
+                    target.copy_(source.to(device=target.device))
+                    loaded += 1
+    if loaded != len(weight_map):
+        raise RuntimeError(f'loaded {loaded} System2 tensors, expected {len(weight_map)}')
+    return {
+        'path': str(path),
+        'tensor_count': loaded,
+        'index_path': str(index_path),
+    }
+
+
 class InternVLAN1AsyncAgent:
     def __init__(self, args):
         _register_internvla_transformers_classes()
@@ -182,6 +242,15 @@ class InternVLAN1AsyncAgent:
         )
         self.model.eval()
         self.model.to(self.device)
+        system2_checkpoint = str(
+            getattr(args, 'system2_model_path', '')
+            or os.environ.get('ARENA_INTERNNAV_SYSTEM2_MODEL_PATH', '')
+        ).strip()
+        self.system2_checkpoint = (
+            _load_system2_checkpoint(self.model, system2_checkpoint)
+            if system2_checkpoint
+            else None
+        )
 
         self.processor = _load_qwen25_vl_processor(args.model_path)
         self.processor.tokenizer.padding_side = 'left'

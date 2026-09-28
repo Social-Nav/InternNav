@@ -34,7 +34,11 @@ def _resolve_depthanything_checkpoint():
 def build_navdp(navdp_cfg, memory_size):
     from .navdp import NavDP_Policy_DPT_CriticSum_DAT
 
-    navdp = NavDP_Policy_DPT_CriticSum_DAT(memory_size=memory_size, navdp_version=0.1)
+    navdp = NavDP_Policy_DPT_CriticSum_DAT(
+        memory_size=memory_size,
+        navdp_version=0.1,
+        rgbd_checkpoint=_resolve_depthanything_checkpoint(),
+    )
     navdp.load_model()
     return navdp
 

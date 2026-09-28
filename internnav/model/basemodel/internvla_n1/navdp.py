@@ -1,7 +1,13 @@
 import torch
 import torch.nn as nn
 from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
-from diffusion_policy.model.diffusion.positional_embedding import SinusoidalPosEmb
+
+try:
+    from diffusion_policy.model.diffusion.positional_embedding import SinusoidalPosEmb
+except ModuleNotFoundError:
+    # The upstream diffusion-policy git submodule is optional in the deployed
+    # InternNav image, while InternNav already vendors this exact utility.
+    from internnav.model.encoder.diffusion_policy.model.diffusion.positional_embedding import SinusoidalPosEmb
 
 from internnav.model.encoder.navdp_backbone import *  # noqa: F403
 
@@ -31,6 +37,7 @@ class NavDP_Policy_DPT_CriticSum_DAT(nn.Module):
         input_dtype="bf16",
         navdp_pretrained=None,
         navdp_version=0.0,
+        rgbd_checkpoint=None,
         device='cuda:0',
     ):
         super().__init__()
@@ -51,7 +58,12 @@ class NavDP_Policy_DPT_CriticSum_DAT(nn.Module):
             self.input_dtype = torch.float32
 
         self.rgbd_encoder = DAT_RGBD_Patch_Backbone(  # noqa: F405
-            image_size, token_dim, memory_size=memory_size, finetune=finetune, version=navdp_version
+            image_size,
+            token_dim,
+            memory_size=memory_size,
+            finetune=finetune,
+            version=navdp_version,
+            checkpoint=rgbd_checkpoint or "checkpoints/depth_anything_v2_vits.pth",
         )
         self.point_encoder = nn.Linear(3, self.token_dim)
         self.decoder_layer = nn.TransformerDecoderLayer(

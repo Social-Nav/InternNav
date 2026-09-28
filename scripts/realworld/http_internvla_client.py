@@ -250,6 +250,15 @@ def _classify_dual_system_response(response):
     return 'unknown'
 
 
+def _is_terminal_model_stop_response(response):
+    """Accept STOP only from a successful model response, never an error fallback."""
+    if not isinstance(response, dict):
+        return False
+    if str(response.get('status', '') or '') != 'internvla_realworld_http_command':
+        return False
+    return response.get('discrete_action') in ([0], 0)
+
+
 def control_thread():
     global desired_v, desired_w
     while True:
@@ -385,8 +394,14 @@ def _publish_status(status, *, emit_trace=True, **debug):
         'desired_w': desired_w,
         'control_mode': current_control_mode.name,
         'policy_init': policy_init,
+        'episode': getattr(manager, 'eval_ready_episode', None),
+        'episode_started': bool(getattr(manager, 'episode_started', False)),
         'debug': debug,
     }
+    if 'terminal' in debug:
+        payload['terminal'] = bool(debug.get('terminal'))
+    if debug.get('termination_reason') is not None:
+        payload['termination_reason'] = str(debug.get('termination_reason'))
     manager.publish_status(payload)
     if emit_trace:
         _write_trace(status, **debug)
@@ -769,6 +784,21 @@ def planning_thread():
 
             manager.publish_model_output(response)
 
+            if (
+                isinstance(response, dict)
+                and str(response.get('status', '') or '') == 'internvla_realworld_http_error'
+            ):
+                print('official InternNav server returned a safe zero-action error; keeping the episode active')
+                _publish_status(
+                    'adapter_exception',
+                    terminal=False,
+                    error=(response.get('debug') or {}).get('error'),
+                    raw_response=response,
+                )
+                _stop_robot('internnav_server_error')
+                time.sleep(0.1)
+                continue
+
             global current_control_mode
             traj_len = 0.0
             if 'trajectory' in response or 'output_trajectory' in response:
@@ -840,8 +870,21 @@ def planning_thread():
                         trajectory=None,
                         mode='stop',
                     )
-                    _publish_status('stop', discrete_action=actions, raw_response=response)
+                    terminal_model_stop = _is_terminal_model_stop_response(response)
+                    _publish_status(
+                        'stop' if terminal_model_stop else 'nonterminal_zero_action',
+                        terminal=terminal_model_stop,
+                        termination_reason='model_stop' if terminal_model_stop else None,
+                        discrete_action=actions,
+                        raw_response=response,
+                    )
                     _stop_robot('internnav_stop')
+                    if terminal_model_stop:
+                        # Match VLN-CE semantics: symbolic STOP terminates the
+                        # environment episode. Arena consumes the latched status
+                        # and records whether the final pose was actually a task
+                        # success; do not keep asking the model after STOP.
+                        manager.episode_started = False
                 elif actions != [5] and actions != [9]:
                     manager.incremental_change_goal(actions)
                     current_control_mode = ControlMode.PID_Mode

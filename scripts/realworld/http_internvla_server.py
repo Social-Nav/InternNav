@@ -101,6 +101,7 @@ def health():
         'idx': idx,
         'model_path': getattr(args, 'model_path', ''),
         'device': getattr(args, 'device', ''),
+        'system2_checkpoint': getattr(agent, 'system2_checkpoint', None),
     })
 
 
@@ -185,6 +186,11 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument("--device", type=str, default="cuda:0")
     parser.add_argument("--model_path", type=str, default="checkpoints/InternVLA-N1")
+    parser.add_argument(
+        "--system2-model-path",
+        default="",
+        help="Optional pure Qwen2.5-VL System2 checkpoint overlaid on the DualVLN base.",
+    )
     parser.add_argument("--resize_w", type=int, default=384)
     parser.add_argument("--resize_h", type=int, default=384)
     parser.add_argument("--num_history", type=int, default=8)
@@ -198,6 +204,11 @@ if __name__ == '__main__':
         [[386.5, 0.0, 328.9, 0.0], [0.0, 386.5, 244, 0.0], [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0]]
     )
     agent = InternVLAN1AsyncAgent(args)
+    print(
+        'InternVLA System2 checkpoint: '
+        + json.dumps(getattr(agent, 'system2_checkpoint', None), sort_keys=True),
+        flush=True,
+    )
     agent.step(
         np.zeros((480, 640, 3), dtype=np.uint8),
         np.zeros((480, 640), dtype=np.float32),
